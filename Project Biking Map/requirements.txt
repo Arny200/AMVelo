@@ -1,0 +1,4 @@
+Flask>=3.0,<4.0
+cryptography>=43,<47
+fitdecode>=0.10,<1
+waitress>=3.0,<4.0

@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#fbfcfa">
+  <meta name="description" content="A private bike map that estimates rides from your own cycling history.">
+  <title>AMVelo — your bike map</title>
+  <script>
+    try {
+      const savedTheme = localStorage.getItem("cadence-theme");
+      document.documentElement.dataset.theme =
+        savedTheme === "dark" || savedTheme === "light"
+          ? savedTheme
+          : window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    } catch {
+      document.documentElement.dataset.theme = "light";
+    }
+  </script>
+  <link rel="preconnect" href="https://unpkg.com">
+  <link rel="preconnect" href="https://tile.openstreetmap.org">
+  <link rel="preconnect" href="https://api.open-meteo.com">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="AMVelo home">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32" fill="none"><circle cx="8" cy="22" r="5.5"/><circle cx="24" cy="22" r="5.5"/><path d="m8 22 6-10 6 10H8Zm6-10h5m-3 0 8 10"/></svg>
+          </span>
+          <span>AMVelo</span>
+        </a>
+        <div class="topbar-actions">
+          <button class="icon-button" id="theme-toggle" type="button" aria-label="Switch to dark mode" aria-pressed="false" title="Dark mode">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20.2 15.4A8.5 8.5 0 0 1 8.6 3.8 8.5 8.5 0 1 0 20.2 15.4Z"/><path d="M16.5 3.2v3m-1.5-1.5h3"/></svg>
+          </button>
+          <button class="icon-button" id="menu-button" aria-label="Open settings" title="Settings">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 15.2a3.2 3.2 0 1 0 0-6.4 3.2 3.2 0 0 0 0 6.4Z"/><path d="m19.4 15 .1.1a1.8 1.8 0 1 1-2.6 2.6l-.1-.1a1.8 1.8 0 0 0-3 .9v.3a1.8 1.8 0 1 1-3.6 0v-.2a1.8 1.8 0 0 0-3-.9l-.1.1a1.8 1.8 0 1 1-2.6-2.6l.1-.1a1.8 1.8 0 0 0-.9-3H3.5a1.8 1.8 0 1 1 0-3.6h.2a1.8 1.8 0 0 0 .9-3l-.1-.1a1.8 1.8 0 1 1 2.6-2.6l.1.1a1.8 1.8 0 0 0 3-.9v-.3a1.8 1.8 0 1 1 3.6 0v.2a1.8 1.8 0 0 0 3 .9l.1-.1a1.8 1.8 0 1 1 2.6 2.6l-.1.1a1.8 1.8 0 0 0 .9 3h.3a1.8 1.8 0 1 1 0 3.6h-.2a1.8 1.8 0 0 0-.9 3Z"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <section class="auth-card" id="auth-card">
+        <div class="eyebrow"><span class="live-dot"></span> PRIVATE BY DESIGN</div>
+        <h1>Your rides<br>stay yours<span class="brand-period">.</span></h1>
+        <p class="intro">Sign in to your private cycling space, or create an account. Only you can see the rides saved to your account.</p>
+        <div class="auth-tabs" role="tablist" aria-label="Account access">
+          <button class="auth-tab active" id="login-tab" type="button" role="tab" aria-selected="true">Sign in</button>
+          <button class="auth-tab" id="register-tab" type="button" role="tab" aria-selected="false">Create account</button>
+        </div>
+        <form id="auth-form">
+          <label class="field-label" for="auth-email">EMAIL</label>
+          <input class="auth-input" id="auth-email" name="email" type="email" autocomplete="email" maxlength="254" required>
+          <label class="field-label" for="auth-password">PASSWORD</label>
+          <input class="auth-input" id="auth-password" name="password" type="password" autocomplete="current-password" minlength="12" maxlength="1024" required>
+          <p class="auth-hint" id="auth-hint">Use your email and password to continue.</p>
+          <p class="auth-error" id="auth-error" aria-live="polite" hidden></p>
+          <button class="primary-button" id="auth-submit" type="submit"><span>Sign in</span><span aria-hidden="true">↗</span></button>
+        </form>
+      </section>
+      <div class="account-bar" id="account-bar" hidden>
+        <span>PRIVATE ACCOUNT · <strong id="account-email"></strong></span>
+        <span>
+          <button id="delete-account-button" type="button">Delete</button>
+          <button id="logout-button" type="button">Sign out</button>
+        </span>
+      </div>
+
+      <div class="private-content" id="private-content" hidden>
+      <section class="welcome">
+        <div class="eyebrow"><span class="live-dot"></span> YOUR OWN PACE, YOUR OWN MAP</div>
+        <h1>Where to<br>next<span class="brand-period">?</span></h1>
+        <p class="intro">A bike route that knows how you ride.</p>
+      </section>
+
+      <section class="route-form" id="route-form" aria-label="Plan a bike route">
+        <label class="field-label" for="origin-input">DEPARTURE · IRELAND</label>
+        <div class="destination-wrap route-point-wrap">
+          <span class="destination-dot start-dot" aria-hidden="true"></span>
+          <input id="origin-input" type="search" placeholder="Choose a departure point" autocomplete="off">
+          <button class="field-action" id="location-button" type="button" aria-label="Use my current location" title="Use my current location">◎</button>
+          <button class="field-action" data-pick-map="origin" type="button" aria-label="Pick departure point on map" title="Pick departure point on map">⌖</button>
+          <button class="clear-button" id="clear-origin" type="button" aria-label="Clear departure point" hidden>×</button>
+        </div>
+        <ul class="suggestions" id="origin-suggestions" role="listbox" hidden></ul>
+        <label class="field-label destination-label" for="destination-input">ARRIVAL · IRELAND</label>
+        <div class="destination-wrap">
+          <span class="destination-dot" aria-hidden="true"></span>
+          <input id="destination-input" type="search" placeholder="Choose an arrival point" autocomplete="off">
+          <button class="field-action" data-pick-map="destination" type="button" aria-label="Pick arrival point on map" title="Pick arrival point on map">⌖</button>
+          <button class="clear-button" id="clear-destination" type="button" aria-label="Clear arrival point" hidden>×</button>
+        </div>
+        <ul class="suggestions" id="suggestions" role="listbox" hidden></ul>
+        <div class="stop-list" id="stop-list"></div>
+        <button class="add-stop-button" id="add-stop-button" type="button">+ Add a stop</button>
+        <label class="field-label schedule-label" id="departure-label" for="departure-date">DEPARTURE TIME</label>
+        <div class="date-time-control">
+          <input class="schedule-input schedule-date" id="departure-date" type="date" aria-label="Departure date">
+          <button class="clock-picker-trigger" id="departure-clock" type="button" aria-haspopup="dialog">17:00 <span aria-hidden="true">◷</span></button>
+        </div>
+        <input id="departure-time" type="hidden">
+        <label class="field-label schedule-label" for="comfort-margin">COMFORT MARGIN</label>
+        <select class="schedule-input comfort-margin" id="comfort-margin">
+          <option value="0">No extra time</option>
+          <option value="5">5 minutes</option>
+          <option value="10">10 minutes</option>
+          <option value="15">15 minutes</option>
+          <option value="20">20 minutes</option>
+          <option value="30">30 minutes</option>
+          <option value="45">45 minutes</option>
+          <option value="60">1 hour</option>
+        </select>
+        <label class="return-toggle">
+          <input id="return-trip" type="checkbox">
+          <span class="return-toggle-mark" aria-hidden="true"></span>
+          <span>Return to my departure point</span>
+        </label>
+        <div class="return-schedule" id="return-schedule" hidden>
+          <label class="return-toggle schedule-backwards">
+            <input id="plan-return-time" type="checkbox">
+            <span class="return-toggle-mark" aria-hidden="true"></span>
+            <span>Plan backwards from when I need to be home</span>
+          </label>
+          <div class="return-deadline-fields" id="return-deadline-fields" hidden>
+            <label class="field-label schedule-label" for="return-by-date">HOME BY</label>
+            <div class="deadline-controls">
+              <input class="schedule-input schedule-date" id="return-by-date" type="date" aria-label="Return home by date">
+              <button class="clock-picker-trigger" id="return-by-clock" type="button" aria-haspopup="dialog">21:00 <span aria-hidden="true">◷</span></button>
+              <button class="sunset-button" id="return-sunset" type="button" aria-pressed="false">At sunset</button>
+            </div>
+            <input id="return-by-time" type="hidden">
+            <p class="schedule-hint" id="schedule-hint">We’ll estimate the latest departure and when to leave the arrival point.</p>
+          </div>
+        </div>
+        <button class="primary-button" id="route-button" disabled>
+          <span>Find route options</span><span aria-hidden="true">↗</span>
+        </button>
+        <p class="form-hint" id="route-hint">Search for places or pick your departure and arrival points on the map.</p>
+      </section>
+
+      <section class="route-result" id="route-result" hidden aria-live="polite">
+        <div class="result-heading">
+          <div>
+            <div class="eyebrow">YOUR PERSONAL ESTIMATE</div>
+            <div class="estimate" id="estimate-time">—</div>
+            <div class="arrival-time" id="arrival-time">Arrive —</div>
+          </div>
+          <button class="icon-button small" id="close-result" aria-label="Close route">×</button>
+        </div>
+        <div class="result-stats">
+          <div><span id="route-distance">—</span><small>distance</small></div>
+          <div><span id="route-pace">—</span><small>your pace</small></div>
+          <div><span id="route-weather-temp">—</span><small>at arrival</small></div>
+        </div>
+        <div class="weather-line" id="weather-line">
+          <span class="weather-icon" id="weather-icon">☀</span>
+          <span id="weather-description">Checking wind along your route…</span>
+          <span class="weather-wind" id="weather-wind">—</span>
+        </div>
+        <div class="route-wind-points" id="route-wind-points"></div>
+        <p class="estimate-note" id="estimate-note">Ride time uses your imported Strava moving speeds and the route distance; it excludes breaks and traffic.</p>
+        <div class="route-option-heading"><span>ROUTE OPTIONS</span><span>Bike-route alternatives</span></div>
+        <div class="route-options" id="route-options" role="group" aria-label="Route options"></div>
+        <p class="estimate-note" id="route-road-note">The quieter-roads option favors routes with the least distance on signed M, N, and R roads; a short main-road link may still be needed.</p>
+        <button class="navigate-button" id="start-navigation" type="button">
+          <span class="navigate-button-icon" aria-hidden="true">➤</span>
+          <span><strong>Start navigation</strong><small>Live GPS guidance on the selected route</small></span>
+          <span class="navigate-button-arrow" aria-hidden="true">↗</span>
+        </button>
+        <p class="navigation-error" id="navigation-error" role="status" hidden></p>
+      </section>
+
+      <section class="strava-card" id="strava-card">
+        <div class="strava-card-top">
+          <div class="strava-icon" aria-hidden="true">S</div>
+          <div><strong id="connection-title">Your rides, your rhythm.</strong><p id="connection-copy">Connect Strava to make every estimate yours.</p></div>
+        </div>
+        <a class="strava-button" id="connect-button" href="/auth/strava">
+          <span>Connect with Strava</span><span aria-hidden="true">↗</span>
+        </a>
+        <div class="sync-details" id="sync-details" hidden>
+          <span><i class="sync-dot"></i><span id="sync-label">Syncing ride history</span></span>
+          <button id="sync-button" type="button">Sync now</button>
+        </div>
+      </section>
+
+      <section class="archive-card" id="archive-card">
+        <div class="section-title"><span>IMPORT YOUR STRAVA ARCHIVE</span><span aria-hidden="true">↗</span></div>
+        <p>Your export is imported into this account only. We use the activity list and ride tracks; profile, social, health, and privacy-zone files are ignored.</p>
+        <form id="archive-form">
+          <label class="archive-file-picker" for="archive-file">
+            <input class="archive-file-input" id="archive-file" name="archive" type="file" accept=".zip,application/zip" required>
+            <span class="archive-file-icon" aria-hidden="true">↑</span>
+            <span class="archive-file-copy"><strong id="archive-file-name">Choose Strava export ZIP</strong><small id="archive-file-detail">Select the ZIP you downloaded from Strava</small></span>
+            <span class="archive-file-action" aria-hidden="true">Browse</span>
+          </label>
+          <button class="archive-button" id="archive-submit" type="submit"><span>Import ride history</span><span aria-hidden="true">↗</span></button>
+        </form>
+        <p class="archive-status" id="archive-status" aria-live="polite">ZIP files up to 100 MB. Your original export is not kept.</p>
+      </section>
+
+      <section class="ride-stats" id="ride-stats" hidden>
+        <div class="section-title"><span>YOUR RIDING LIFE</span><span id="sync-date">—</span></div>
+        <div class="stat-grid">
+          <div><strong id="stat-rides">—</strong><span>rides</span></div>
+          <div><strong id="stat-distance">—</strong><span>kilometres</span></div>
+          <div><strong id="stat-speed">—</strong><span>avg km/h</span></div>
+        </div>
+        <div class="history-footnote"><span class="history-line"></span> Your routes, softly traced</div>
+      </section>
+      </div>
+
+      <footer class="sidebar-footer">
+        <span>MADE FOR THE LONG WAY ROUND</span>
+        <button id="privacy-button" type="button">Privacy &amp; setup</button>
+      </footer>
+    </aside>
+
+    <main class="map-stage">
+      <div id="map" role="application" aria-label="Map showing your cycling routes"></div>
+      <div class="map-top-card">
+        <span class="map-status-dot"></span><span id="map-status">Your map is waiting for you</span>
+      </div>
+      <div class="map-weather" id="map-weather" aria-live="polite">
+        <span class="map-weather-icon" id="map-weather-icon" aria-hidden="true">☁</span>
+        <span class="map-weather-copy">
+          <strong id="map-weather-temperature">Weather</strong>
+          <span id="map-weather-description">Loading map conditions…</span>
+        </span>
+        <span class="map-weather-wind" id="map-weather-wind">—</span>
+      </div>
+      <button class="greenways-toggle" id="greenways-toggle" type="button" aria-label="Hide mapped Irish greenways" aria-pressed="true" title="Hide mapped Irish greenways" disabled>
+        <span class="greenway-key" aria-hidden="true"></span><span>Greenways</span>
+      </button>
+      <button class="rides-toggle" id="rides-toggle" type="button" aria-label="Hide my ride history" aria-pressed="true" title="Hide my ride history" disabled>
+        <span class="rides-key" aria-hidden="true"></span><span>My rides</span>
+      </button>
+      <button class="map-locate icon-button" id="map-locate" aria-label="Center map on my location" title="Center on my location">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3M19.1 4.9l-2.1 2.1M7 17l-2.1 2.1M19.1 19.1 17 17M7 7 4.9 4.9"/></svg>
+      </button>
+      <div class="map-legend"><span class="legend-mark"></span><span>YOUR RIDES</span><span class="legend-divider"></span><span class="legend-route"></span><span>PLANNED ROUTE</span><span class="legend-divider"></span><span class="greenway-key legend-greenway"></span><span>GREENWAYS</span></div>
+      <div class="map-attribution">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a> · Routing by OpenStreetMap · Greenway data © OSM</div>
+      <section class="navigation-ui" id="navigation-ui" aria-label="Bike navigation" hidden>
+        <div class="navigation-guidance">
+          <button class="navigation-exit" id="end-navigation" type="button" aria-label="End navigation">×</button>
+          <span class="navigation-maneuver-icon" id="navigation-maneuver-icon" aria-hidden="true">↑</span>
+          <div class="navigation-guidance-copy">
+            <strong id="navigation-instruction">Follow the route</strong>
+            <span id="navigation-subtext">Waiting for GPS signal…</span>
+          </div>
+        </div>
+        <div class="navigation-dashboard">
+          <div class="navigation-dashboard-top">
+            <div class="navigation-stat navigation-next-turn">
+              <span>REMAINING</span><strong id="navigation-distance">—</strong>
+            </div>
+            <div class="navigation-stat">
+              <span>ETA</span><strong id="navigation-eta">—</strong>
+            </div>
+            <div class="navigation-stat">
+              <span>SPEED</span><strong id="navigation-speed">—</strong>
+            </div>
+          </div>
+          <div class="navigation-route-progress"><span id="navigation-progress"></span></div>
+          <div class="navigation-dashboard-bottom">
+            <span id="navigation-location-status">Waiting for GPS signal…</span>
+            <button id="navigation-recenter" type="button">Recenter</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <dialog class="clock-dialog" id="clock-dialog" aria-labelledby="clock-dialog-title">
+    <form method="dialog" class="clock-dialog-inner">
+    <div class="clock-dialog-heading">
+      <div>
+        <span class="eyebrow">SET A TIME</span>
+        <h2 id="clock-dialog-title">Departure time</h2>
+      </div>
+      <button class="icon-button small" type="button" id="clock-dialog-close" aria-label="Close clock">×</button>
+    </div>
+    <div class="clock-readout" aria-label="Selected time">
+      <button id="clock-hour-value" type="button" aria-label="Choose hour">17</button>
+      <span>:</span>
+      <button id="clock-minute-value" type="button" aria-label="Choose minute">00</button>
+    </div>
+    <div class="clock-face" id="clock-face" role="group" aria-label="Time selection clock"></div>
+    <div class="clock-dialog-actions">
+      <button class="clock-cancel" type="button" id="clock-dialog-cancel">Cancel</button>
+      <button class="clock-confirm" type="button" id="clock-dialog-confirm">Set time</button>
+    </div>
+    </form>
+  </dialog>
+  <dialog class="info-dialog" id="info-dialog">
+    <button class="dialog-close icon-button small" id="dialog-close" aria-label="Close">×</button>
+    <div class="appearance-control">
+      <div><strong>Appearance</strong><span>Choose a map theme</span></div>
+      <button class="theme-switch" id="dialog-theme-toggle" type="button" aria-pressed="false">Dark mode</button>
+    </div>
+    <div class="eyebrow">A LITTLE TRANSPARENCY</div>
+    <h2>Yours, all the way.</h2>
+    <p>Your account can only read its own rides; accounts are separated in storage and personal API responses are not publicly cached. The site operator must protect the server and its database. We import only the Strava activities list and cycling tracks from your archive, not the separate profile, social, health, or privacy-zone files.</p>
+    <p>To plan a route, the app sends your chosen departure, stops, and arrival points to its bicycle-routing provider. Place search sends your search text to OpenStreetMap's Nominatim service; current weather for the map centre and route, sampled route elevations, and sunset times are requested from Open-Meteo; and map tiles reveal the displayed map area to OpenStreetMap. Greenway paths are mapped OpenStreetMap bicycle routes, so completeness depends on the community map data. Use of these external services is optional to your account but needed for those features.</p>
+    <p>Connect Strava to sync future rides, or import an archive snapshot. You can also sync manually any time.</p>
+    <p>Route estimates use your median moving speed from recent rides. They’re a guide, not a promise—and don’t include stops or traffic signals.</p>
+    <button class="dialog-ok primary-button" id="dialog-ok">Got it</button>
+  </dialog>
+  <dialog class="info-dialog" id="delete-dialog">
+    <button class="dialog-close icon-button small" id="delete-dialog-close" aria-label="Close">×</button>
+    <div class="eyebrow">ACCOUNT AND DATA DELETION</div>
+    <h2>Leave no tracks?</h2>
+    <p>This permanently deletes your account, imported rides, map traces, and saved Strava connection from this site. Your original Strava activities remain in Strava. Confirm your password to continue.</p>
+    <form id="delete-account-form">
+      <label class="field-label" for="delete-password">PASSWORD</label>
+      <input class="auth-input" id="delete-password" type="password" autocomplete="current-password" required>
+      <p class="auth-error" id="delete-error" aria-live="polite" hidden></p>
+      <button class="delete-confirm-button" id="delete-confirm-button" type="submit">Delete my account and data</button>
+    </form>
+  </dialog>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
