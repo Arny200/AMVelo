@@ -105,7 +105,14 @@ function setTheme(theme, savePreference = true) {
 }
 
 const ridesLayer = L.layerGroup();
+const aircraftLayer = L.layerGroup();
+const aircraftMarkers = new Map();
 let ridesVisible = true;
+let aircraftVisible = false;
+let aircraftPollTimer = null;
+let aircraftMapRefreshTimer = null;
+let logoClickTimer = null;
+let logoClickCount = 0;
 let routeLayer = null;
 let originMarker = null;
 let destinationMarker = null;
@@ -137,6 +144,12 @@ let navigationCumulativeMeters = [];
 let navigationProgressMeters = 0;
 let navigationLastPosition = null;
 let navigationWakeLock = null;
+let navigationReturnDeadline = null;
+let navigationRouteIsReturn = false;
+let navigationDeadlineRequestId = 0;
+let elevationRequestId = 0;
+let favoritePlaces = [];
+let personalStatsRequest = 0;
 
 const $ = (id) => document.getElementById(id);
 const originInput = $("origin-input");
@@ -296,6 +309,9 @@ function updateRouteButton() {
     !statusData?.has_activities;
   $("clear-origin").hidden = !originInput.value;
   $("clear-destination").hidden = !destinationInput.value;
+  $("save-origin-favorite").hidden = !originField.point;
+  $("save-destination-favorite").hidden = !destinationField.point;
+  updateExploreButton();
 }
 
 function formatDuration(seconds) {
@@ -345,6 +361,9 @@ function renderStatus(data) {
   $("stat-rides").textContent = data.activity_count.toLocaleString();
   $("stat-distance").textContent = data.distance_km.toLocaleString();
   $("stat-speed").textContent = data.average_speed_kmh ?? "—";
+  $("bike-type").value = data.bike_type || "road";
+  $("bike-model").value = data.bike_model || "";
+  renderBikeProfile(data.bike_type || "road", data.bike_model || "");
   $("sync-date").textContent = formatRelativeDate(data.last_sync_at || data.archive_imported_at);
   if (data.connected) {
     $("connection-title").textContent = data.athlete_name
@@ -380,6 +399,250 @@ function renderStatus(data) {
     setRouteHint("Import your Strava archive or connect Strava to get started.");
   }
   updateRouteButton();
+  void loadFavorites();
+}
+
+function renderBikeProfile(type, model) {
+  const image = $("bike-profile-image");
+  image.dataset.bikeType = type;
+  image.setAttribute("aria-label", `${type} bicycle illustration`);
+  $("bike-summary").textContent = model || {
+    road: "Road bike",
+    gravel: "Gravel bike",
+    mountain: "Mountain bike",
+    electric: "E-bike",
+    city: "City / hybrid bike",
+    other: "My bike",
+  }[type] || "My bike";
+}
+
+function setWorkspaceView(viewId) {
+  for (const view of document.querySelectorAll(".workspace-tab")) {
+    const selected = view.dataset.view === viewId;
+    view.classList.toggle("active", selected);
+    view.setAttribute("aria-selected", String(selected));
+  }
+  for (const page of document.querySelectorAll(".tab-view")) {
+    const selected = page.id === viewId;
+    page.hidden = !selected;
+    page.classList.toggle("active", selected);
+  }
+  if (viewId === "stats-view") void loadPersonalStats();
+  if (viewId === "explore-view") updateExploreButton();
+  requestAnimationFrame(() => map.invalidateSize());
+}
+
+function updateExploreButton() {
+  const button = $("explore-button");
+  if (!button) return;
+  button.disabled = !origin || !statusData?.has_activities;
+  $("explore-hint").textContent = origin
+    ? "Places are ranked by your Strava-based round-trip time estimate."
+    : "Choose a departure point on the Plan ride tab first.";
+}
+
+async function exploreReachablePlaces() {
+  if (!origin || $("explore-button").disabled) return;
+  const button = $("explore-button");
+  const results = $("explore-results");
+  button.disabled = true;
+  button.querySelector("span:first-child").textContent = "Finding places…";
+  results.replaceChildren();
+  $("explore-hint").textContent = "Searching nearby places and estimating both directions at your usual pace…";
+  try {
+    const response = await fetchJson("/api/reachable-places", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        start: { ...origin },
+        duration_minutes: Number($("explore-duration").value),
+      }),
+    });
+    $("explore-hint").classList.remove("error");
+    if (!response.places.length) {
+      $("explore-hint").textContent = `No places fit within ${response.duration_minutes} minutes at your typical ${response.personal_speed_kmh} km/h pace. Try a longer ride time.`;
+      return;
+    }
+    $("explore-hint").textContent = `Round-trip estimates use your typical ${response.personal_speed_kmh} km/h Strava pace.`;
+    for (const place of response.places) {
+      const item = document.createElement("article");
+      item.className = "explore-place";
+      const copy = document.createElement("div");
+      const name = document.createElement("strong");
+      name.textContent = place.label;
+      const detail = document.createElement("span");
+      detail.textContent = `${place.outbound_km} km out · ${place.return_km} km back · about ${formatDuration(place.round_trip_minutes * 60)} riding`;
+      copy.append(name, detail);
+      const select = document.createElement("button");
+      select.type = "button";
+      select.textContent = "Plan";
+      select.setAttribute("aria-label", `Plan a return ride to ${place.label}`);
+      select.addEventListener("click", () => {
+        setWorkspaceView("planner-view");
+        if (!updatePlaceValue(destinationField, L.latLng(place.lat, place.lon), place.label)) return;
+        $("return-trip").checked = true;
+        $("return-schedule").hidden = false;
+        $("return-trip").dispatchEvent(new Event("change", { bubbles: true }));
+        if (!routeRequestPending) void planRoute();
+      });
+      item.append(copy, select);
+      results.append(item);
+    }
+  } catch (error) {
+    $("explore-hint").textContent = error.message;
+    $("explore-hint").classList.add("error");
+  } finally {
+    button.disabled = !origin || !statusData?.has_activities;
+    button.querySelector("span:first-child").textContent = "Find reachable places";
+  }
+}
+
+async function loadPersonalStats() {
+  const requestId = ++personalStatsRequest;
+  try {
+    const stats = await fetchJson("/api/stats");
+    if (requestId !== personalStatsRequest) return;
+    $("stats-updated").textContent = `${stats.ride_count.toLocaleString()} rides`;
+    const cards = [
+      ["Total distance", `${stats.distance_km.toLocaleString()} km`],
+      ["Time in the saddle", `${stats.moving_hours.toLocaleString()} hr`],
+      ["Elevation climbed", `${stats.elevation_gain_m.toLocaleString()} m`],
+      ["Average speed", stats.average_speed_kmh === null ? "—" : `${stats.average_speed_kmh} km/h`],
+      ["Longest ride", `${stats.longest_ride_km} km`],
+      ["Fastest average", `${stats.fastest_average_kmh} km/h`],
+    ];
+    $("personal-stats-grid").replaceChildren(...cards.map(([label, value]) => {
+      const card = document.createElement("div");
+      card.className = "personal-stat-card";
+      const strong = document.createElement("strong");
+      strong.textContent = value;
+      const caption = document.createElement("span");
+      caption.textContent = label;
+      card.append(strong, caption);
+      return card;
+    }));
+    const maxDistance = Math.max(1, ...stats.yearly.map((year) => year.distance_km));
+    $("yearly-stats").replaceChildren(...stats.yearly.slice().reverse().map((year) => {
+      const row = document.createElement("div");
+      row.className = "yearly-stat";
+      const label = document.createElement("span");
+      label.textContent = year.year;
+      const barWrap = document.createElement("span");
+      barWrap.className = "yearly-stat-bar-wrap";
+      const bar = document.createElement("i");
+      bar.style.width = `${Math.max(2, year.distance_km / maxDistance * 100)}%`;
+      barWrap.append(bar);
+      const value = document.createElement("strong");
+      value.textContent = `${year.distance_km.toLocaleString()} km · ${year.ride_count} rides · ${year.elevation_gain_m.toLocaleString()} m up`;
+      row.append(label, barWrap, value);
+      return row;
+    }));
+    $("longest-rides").replaceChildren(...stats.longest_rides.map((ride) => {
+      const row = document.createElement("div");
+      row.className = "longest-ride";
+      const title = document.createElement("strong");
+      title.textContent = ride.name;
+      const detail = document.createElement("span");
+      detail.textContent = `${ride.distance_km} km · ${formatDuration(ride.moving_time)} · ${new Date(ride.start_date).toLocaleDateString()}`;
+      row.append(title, detail);
+      return row;
+    }));
+  } catch (error) {
+    if (requestId === personalStatsRequest) {
+      $("stats-updated").textContent = error.message;
+    }
+  }
+}
+
+async function saveBikeProfile(event) {
+  event.preventDefault();
+  const button = $("bike-profile-form").querySelector('button[type="submit"]');
+  button.disabled = true;
+  try {
+    const profile = await fetchJson("/api/profile", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        bike_type: $("bike-type").value,
+        bike_model: $("bike-model").value,
+      }),
+    });
+    renderBikeProfile(profile.bike_type, profile.bike_model);
+    $("bike-profile-message").textContent = "Bike saved to your private profile.";
+  } catch (error) {
+    $("bike-profile-message").textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function loadFavorites() {
+  try {
+    favoritePlaces = await fetchJson("/api/favorites");
+    renderFavorites();
+  } catch (error) {
+    setRouteHint(error.message, true);
+  }
+}
+
+function renderFavorites() {
+  const list = $("favorite-places-list");
+  list.replaceChildren();
+  $("favorites-panel").hidden = favoritePlaces.length === 0;
+  for (const favorite of favoritePlaces) {
+    const row = document.createElement("div");
+    row.className = "favorite-place";
+    const name = document.createElement("strong");
+    name.textContent = favorite.label;
+    const actions = document.createElement("span");
+    for (const [role, title] of [["origin", "Set as departure"], ["destination", "Set as arrival"]]) {
+      const use = document.createElement("button");
+      use.type = "button";
+      use.textContent = role === "origin" ? "Depart" : "Arrive";
+      use.title = title;
+      use.addEventListener("click", () => {
+        const field = role === "origin" ? originField : destinationField;
+        updatePlaceValue(field, L.latLng(favorite.lat, favorite.lon), favorite.label);
+        map.flyTo([favorite.lat, favorite.lon], 13, { duration: 0.6 });
+      });
+      actions.append(use);
+    }
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "favorite-remove";
+    remove.textContent = "×";
+    remove.setAttribute("aria-label", `Remove ${favorite.label} from favorites`);
+    remove.addEventListener("click", () => void removeFavorite(favorite.id));
+    actions.append(remove);
+    row.append(name, actions);
+    list.append(row);
+  }
+}
+
+async function addFavorite(field) {
+  if (!field.point) return;
+  const label = field.input.value.trim();
+  try {
+    await fetchJson("/api/favorites", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label, lat: field.point.lat, lon: field.point.lon }),
+    });
+    await loadFavorites();
+    setRouteHint(`${label} saved to your favorites.`);
+  } catch (error) {
+    setRouteHint(error.message, true);
+  }
+}
+
+async function removeFavorite(favoriteId) {
+  try {
+    await fetchJson(`/api/favorites/${favoriteId}`, { method: "DELETE" });
+    favoritePlaces = favoritePlaces.filter((favorite) => favorite.id !== favoriteId);
+    renderFavorites();
+  } catch (error) {
+    setRouteHint(error.message, true);
+  }
 }
 
 function renderSignedOut() {
@@ -482,9 +745,140 @@ function setRidesVisible(visible) {
   toggle.title = isVisible ? "Hide my ride history" : "Show my ride history";
 }
 
+function aircraftRadiusNauticalMiles() {
+  return Math.max(5, Math.min(120, 120 * 2 ** (7 - map.getZoom())));
+}
+
+function createAircraftPopup(plane) {
+  const content = document.createElement("div");
+  content.className = "aircraft-popup";
+  const title = document.createElement("strong");
+  title.textContent = plane.callsign || plane.registration || plane.hex || "Aircraft";
+  content.append(title);
+  const details = [
+    ["Registration", plane.registration],
+    ["Type", plane.type],
+    ["Altitude", plane.on_ground ? "On ground" : plane.altitude_ft === null ? "Unknown" : `${Math.round(plane.altitude_ft).toLocaleString()} ft`],
+    ["Speed", plane.speed_kt === null ? "Unknown" : `${Math.round(plane.speed_kt)} kt`],
+  ];
+  for (const [label, value] of details) {
+    const row = document.createElement("span");
+    const name = document.createElement("small");
+    name.textContent = label;
+    const contentValue = document.createElement("b");
+    contentValue.textContent = value || "Unknown";
+    row.append(name, contentValue);
+    content.append(row);
+  }
+  return content;
+}
+
+function updateAircraftMarker(plane) {
+  const bearing = Number.isFinite(plane.track) ? plane.track : 0;
+  const icon = L.divIcon({
+    className: "aircraft-icon-wrap",
+    html: `<span class="aircraft-icon" style="--heading:${bearing}deg" aria-hidden="true">▲</span>`,
+    iconSize: [24, 24],
+    iconAnchor: [12, 12],
+  });
+  let marker = aircraftMarkers.get(plane.hex);
+  if (!marker) {
+    marker = L.marker([plane.lat, plane.lon], { icon, keyboard: false });
+    marker.addTo(aircraftLayer);
+    aircraftMarkers.set(plane.hex, marker);
+  } else {
+    marker.setLatLng([plane.lat, plane.lon]);
+    marker.setIcon(icon);
+  }
+  marker.bindPopup(createAircraftPopup(plane));
+}
+
+async function refreshAircraft() {
+  if (!aircraftVisible) return;
+  const center = map.getCenter();
+  const params = new URLSearchParams({
+    lat: center.lat.toFixed(4),
+    lon: center.lng.toFixed(4),
+    radius_nm: String(Math.round(aircraftRadiusNauticalMiles())),
+  });
+  try {
+    const result = await fetchJson(`/api/aircraft?${params}`);
+    if (!aircraftVisible) return;
+    const seen = new Set();
+    for (const plane of result.aircraft) {
+      if (!plane.hex) continue;
+      seen.add(plane.hex);
+      updateAircraftMarker(plane);
+    }
+    for (const [hex, marker] of aircraftMarkers) {
+      if (seen.has(hex)) continue;
+      aircraftLayer.removeLayer(marker);
+      aircraftMarkers.delete(hex);
+    }
+    $("aircraft-attribution").hidden = false;
+    setMapStatus(`${result.aircraft.length} aircraft in this area · tap AMVelo once to hide`);
+  } catch (error) {
+    console.error("Could not refresh aircraft over the map.", error);
+    setMapStatus("Live aircraft are temporarily unavailable · tap AMVelo to hide");
+  }
+}
+
+function setAircraftVisible(visible) {
+  aircraftVisible = visible;
+  if (aircraftPollTimer) {
+    clearInterval(aircraftPollTimer);
+    aircraftPollTimer = null;
+  }
+  clearTimeout(aircraftMapRefreshTimer);
+  aircraftMapRefreshTimer = null;
+  if (aircraftVisible) {
+    aircraftLayer.addTo(map);
+    void refreshAircraft();
+    aircraftPollTimer = setInterval(() => void refreshAircraft(), 20_000);
+  } else {
+    map.removeLayer(aircraftLayer);
+    aircraftLayer.clearLayers();
+    aircraftMarkers.clear();
+    $("aircraft-attribution").hidden = true;
+    if (statusData) setMapStatus(`${statusData.activity_count.toLocaleString()} rides in your private map`);
+    else setMapStatus("Your private ride map");
+  }
+}
+
+function scheduleAircraftRefresh() {
+  if (!aircraftVisible) return;
+  clearTimeout(aircraftMapRefreshTimer);
+  aircraftMapRefreshTimer = setTimeout(() => {
+    aircraftMapRefreshTimer = null;
+    void refreshAircraft();
+  }, 700);
+}
+
+$("brand").addEventListener("click", (event) => {
+  event.preventDefault();
+  if (aircraftVisible) {
+    logoClickCount = 0;
+    clearTimeout(logoClickTimer);
+    setAircraftVisible(false);
+    return;
+  }
+  logoClickCount += 1;
+  clearTimeout(logoClickTimer);
+  logoClickTimer = setTimeout(() => {
+    logoClickCount = 0;
+  }, 1500);
+  if (logoClickCount >= 3) {
+    logoClickCount = 0;
+    clearTimeout(logoClickTimer);
+    setAircraftVisible(true);
+  }
+});
+map.on("moveend zoomend", scheduleAircraftRefresh);
+
 function clearRouteDisplay() {
   routeRequestId += 1;
   scheduleRequestId += 1;
+  elevationRequestId += 1;
   if (routeLayer) routeLayer.remove();
   routeLayer = null;
   routeOptions = [];
@@ -494,6 +888,8 @@ function clearRouteDisplay() {
   $("departure-clock").disabled = false;
   $("departure-label").textContent = "DEPARTURE TIME";
   $("route-options").replaceChildren();
+  $("route-gradient").hidden = true;
+  $("gradient-chart").replaceChildren();
   $("route-result").hidden = true;
   lastRoutedDestination = null;
 }
@@ -531,6 +927,10 @@ function updatePlaceValue(field, point, label) {
       stop.point = field.point;
       stop.marker = field.marker;
     }
+    if (field.role === "origin") {
+      $("explore-results").replaceChildren();
+      $("explore-hint").classList.remove("error");
+    }
   }
   activePlaceField = null;
   pendingMapField = null;
@@ -550,6 +950,80 @@ function updatePlaceValue(field, point, label) {
       : "Choose another point, or use the map to set it.",
   );
   return true;
+}
+
+async function renderElevationProfile(option) {
+  const requestId = ++elevationRequestId;
+  const panel = $("route-gradient");
+  panel.hidden = false;
+  $("gradient-summary").textContent = "Loading profile…";
+  $("gradient-chart").replaceChildren();
+  try {
+    let profileData;
+    if (Array.isArray(option.elevation_profile) && option.elevation_profile.length >= 2) {
+      profileData = {
+        profile: option.elevation_profile,
+        elevation_gain_m: option.elevation_gain_m,
+        elevation_loss_m: option.elevation_loss_m,
+      };
+    } else {
+      profileData = await fetchJson("/api/elevation-profile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ coordinates: option.geometry.coordinates }),
+      });
+    }
+    if (requestId !== elevationRequestId || option.id !== selectedRouteId) return;
+    const result = profileData.profile;
+    if (!Array.isArray(result) || result.length < 2) {
+      throw new Error("Elevation provider returned an incomplete route profile.");
+    }
+    const elevations = result.map((point) => Number(point.elevation_m));
+    const minElevation = Math.min(...elevations);
+    const elevationRange = Math.max(1, Math.max(...elevations) - minElevation);
+    const ascent = Math.round(Number(profileData.elevation_gain_m ?? option.elevation_gain_m ?? 0));
+    const descent = Math.round(Number(profileData.elevation_loss_m ?? option.elevation_loss_m ?? 0));
+    const gradients = result
+      .slice(0, -1)
+      .map((point) => Number(point.gradient_percent))
+      .filter(Number.isFinite);
+    const steepestUphill = Math.max(0, ...gradients);
+    const steepestDownhill = Math.min(0, ...gradients);
+    $("gradient-summary").textContent = `${ascent} m up · ${descent} m down`;
+    $("gradient-max-uphill").textContent = `Uphill · ${steepestUphill.toFixed(1)}% max`;
+    $("gradient-max-downhill").textContent = `Downhill · ${Math.abs(steepestDownhill).toFixed(1)}% max`;
+    const svgNamespace = "http://www.w3.org/2000/svg";
+    const chart = document.createElementNS(svgNamespace, "svg");
+    chart.setAttribute("viewBox", "0 0 320 96");
+    chart.setAttribute("role", "img");
+    chart.setAttribute("aria-label", `Elevation profile, ${ascent} metres climbing and ${descent} metres descending`);
+    for (let index = 1; index < result.length; index += 1) {
+      const x1 = 8 + (index - 1) / (result.length - 1) * 304;
+      const x2 = 8 + index / (result.length - 1) * 304;
+      const y1 = 82 - (elevations[index - 1] - minElevation) / elevationRange * 68;
+      const y2 = 82 - (elevations[index] - minElevation) / elevationRange * 68;
+      const line = document.createElementNS(svgNamespace, "line");
+      line.setAttribute("x1", String(x1));
+      line.setAttribute("y1", String(y1));
+      line.setAttribute("x2", String(x2));
+      line.setAttribute("y2", String(y2));
+      line.setAttribute("stroke", elevations[index] > elevations[index - 1] ? "#c77d4e" : elevations[index] < elevations[index - 1] ? "#5188a0" : "#94a197");
+      line.setAttribute("stroke-width", "2.5");
+      line.setAttribute("stroke-linecap", "round");
+      const title = document.createElementNS(svgNamespace, "title");
+      title.textContent = `${result[index - 1].distance_km}–${result[index].distance_km} km · ${result[index].gradient_percent}% gradient`;
+      line.append(title);
+      chart.append(line);
+    }
+    $("gradient-chart").replaceChildren(chart);
+  } catch (error) {
+    if (requestId !== elevationRequestId || option.id !== selectedRouteId) return;
+    $("gradient-summary").textContent = "Unavailable";
+    const message = document.createElement("span");
+    message.className = "gradient-error";
+    message.textContent = error.message;
+    $("gradient-chart").replaceChildren(message);
+  }
 }
 
 function createStopField() {
@@ -634,6 +1108,10 @@ function registerPlaceField(field) {
   });
   field.input.addEventListener("input", () => {
     const query = field.input.value.trim();
+    if (field.role === "origin") {
+      $("explore-results").replaceChildren();
+      $("explore-hint").classList.remove("error");
+    }
     if (query !== field.input.dataset.selectedLabel && field.point) {
       if (field.marker) field.marker.remove();
       field.marker = null;
@@ -1323,6 +1801,7 @@ function refreshRouteSchedule() {
 
 async function selectRouteOption(option) {
   drawSelectedRoute(option);
+  void renderElevationProfile(option);
   await updateRouteSchedule(option);
   const totalDistance = option.distance_km + (returnRoute?.distance_km || 0);
   $("route-distance").textContent = `${totalDistance.toFixed(1)} km`;
@@ -1485,6 +1964,30 @@ function updateNavigationDisplay(position, accuracy, speedMetersPerSecond) {
   $("navigation-location-status").textContent = !isOnRoute
     ? "Off route · return to the highlighted line"
     : `GPS accuracy ±${Math.max(1, Math.round(accuracy))} m`;
+  $("navigation-return-button").hidden = !returnRoute || navigationRouteIsReturn;
+  const deadlinePanel = $("navigation-deadline");
+  if (navigationReturnDeadline && returnRoute?.geometry?.coordinates?.length > 1) {
+    const returnCoordinates = returnRoute.geometry.coordinates;
+    let returnMeters = 0;
+    for (let index = 1; index < returnCoordinates.length; index += 1) {
+      returnMeters += metersBetweenCoordinates(returnCoordinates[index - 1], returnCoordinates[index]);
+    }
+    const comfortMarginMinutes = Number($("comfort-margin").value);
+    const comfortSeconds = comfortMarginMinutes * 60 * (navigationRouteIsReturn ? 1 : 2);
+    const availableSeconds = (navigationReturnDeadline.getTime() - Date.now()) / 1000 - comfortSeconds;
+    const remainingJourneyMeters = remaining + (navigationRouteIsReturn ? 0 : returnMeters);
+    const requiredSpeed = availableSeconds > 0
+      ? remainingJourneyMeters / availableSeconds * 3.6
+      : null;
+    deadlinePanel.hidden = false;
+    $("navigation-required-speed").textContent = requiredSpeed === null
+      ? "Deadline passed"
+      : `${requiredSpeed.toFixed(1)} km/h average`;
+    $("navigation-deadline-detail").textContent =
+      `${(remainingJourneyMeters / 1000).toFixed(1)} km left${navigationRouteIsReturn ? "" : " including return"} · home by ${formatClockTime(navigationReturnDeadline)}${comfortSeconds ? ` · ${comfortMarginMinutes} min × ${navigationRouteIsReturn ? "1" : "2"} arrival margins` : ""}`;
+  } else {
+    deadlinePanel.hidden = true;
+  }
 
   const latLng = [position.lat, position.lon];
   if (!navigationMarker) {
@@ -1520,6 +2023,20 @@ function startNavigation() {
   }
   $("navigation-error").hidden = true;
   activeNavigationRoute = option;
+  navigationRouteIsReturn = false;
+  navigationReturnDeadline = null;
+  const deadlineRequestId = ++navigationDeadlineRequestId;
+  $("navigation-deadline").hidden = true;
+  if ($("plan-return-time").checked && returnRoute) {
+    void getReturnDeadline().then((deadline) => {
+      if (deadlineRequestId !== navigationDeadlineRequestId || !activeNavigationRoute) return;
+      navigationReturnDeadline = deadline;
+    }).catch((error) => {
+      if (deadlineRequestId !== navigationDeadlineRequestId) return;
+      console.error("Could not load the return deadline for navigation.", error);
+      $("navigation-location-status").textContent = error.message;
+    });
+  }
   prepareNavigationRoute(option);
   navigationProgressMeters = 0;
   navigationLastPosition = null;
@@ -1552,6 +2069,20 @@ function startNavigation() {
   );
 }
 
+function startReturnNavigation() {
+  if (!returnRoute?.geometry?.coordinates?.length) return;
+  navigationRouteIsReturn = true;
+  activeNavigationRoute = returnRoute;
+  prepareNavigationRoute(returnRoute);
+  navigationProgressMeters = 0;
+  navigationLastPosition = null;
+  $("navigation-instruction").textContent = "Return to your departure point";
+  $("navigation-subtext").textContent = "Following your planned return route";
+  $("navigation-return-button").hidden = true;
+  const coordinates = returnRoute.geometry.coordinates.map(([lon, lat]) => [lat, lon]);
+  map.fitBounds(L.latLngBounds(coordinates), { padding: [100, 70], maxZoom: 16 });
+}
+
 async function requestNavigationWakeLock() {
   if (!document.body.classList.contains("nav-mode") || navigationWakeLock) return;
   if (!navigator.wakeLock) {
@@ -1577,6 +2108,11 @@ async function requestNavigationWakeLock() {
 }
 
 function endNavigation() {
+  navigationDeadlineRequestId += 1;
+  navigationReturnDeadline = null;
+  navigationRouteIsReturn = false;
+  $("navigation-return-button").hidden = true;
+  $("navigation-deadline").hidden = true;
   if (navigationWatchId !== null) {
     navigator.geolocation.clearWatch(navigationWatchId);
     navigationWatchId = null;
@@ -1681,6 +2217,19 @@ $("clear-destination").addEventListener("click", () => {
 });
 $("map-locate").addEventListener("click", setLocation);
 $("route-button").addEventListener("click", planRoute);
+$("explore-button").addEventListener("click", exploreReachablePlaces);
+$("bike-profile-form").addEventListener("submit", saveBikeProfile);
+$("bike-type").addEventListener("change", () => {
+  renderBikeProfile($("bike-type").value, $("bike-model").value.trim());
+});
+$("bike-model").addEventListener("input", () => {
+  renderBikeProfile($("bike-type").value, $("bike-model").value.trim());
+});
+$("save-origin-favorite").addEventListener("click", () => void addFavorite(originField));
+$("save-destination-favorite").addEventListener("click", () => void addFavorite(destinationField));
+for (const tab of document.querySelectorAll(".workspace-tab")) {
+  tab.addEventListener("click", () => setWorkspaceView(tab.dataset.view));
+}
 $("start-navigation").addEventListener("click", startNavigation);
 $("end-navigation").addEventListener("click", endNavigation);
 $("navigation-recenter").addEventListener("click", () => {
@@ -1688,6 +2237,7 @@ $("navigation-recenter").addEventListener("click", () => {
     map.setView(navigationLastPosition, Math.max(map.getZoom(), 16), { animate: true });
   }
 });
+$("navigation-return-button").addEventListener("click", startReturnNavigation);
 $("return-trip").addEventListener("change", () => {
   const enabled = $("return-trip").checked;
   $("return-schedule").hidden = !enabled;
@@ -1766,6 +2316,12 @@ $("sync-button").addEventListener("click", async () => {
 function setAuthMode(mode) {
   authMode = mode;
   const registering = mode === "register";
+  $("auth-form").hidden = false;
+  $("forgot-password-form").hidden = true;
+  $("reset-password-form").hidden = true;
+  $("auth-tabs").hidden = false;
+  $("forgot-password-button").hidden = registering;
+  $("auth-hint").hidden = false;
   $("login-tab").classList.toggle("active", !registering);
   $("register-tab").classList.toggle("active", registering);
   $("login-tab").setAttribute("aria-selected", String(!registering));
@@ -1781,6 +2337,69 @@ function setAuthMode(mode) {
 }
 $("login-tab").addEventListener("click", () => setAuthMode("login"));
 $("register-tab").addEventListener("click", () => setAuthMode("register"));
+$("forgot-password-button").addEventListener("click", () => {
+  $("auth-form").hidden = true;
+  $("auth-tabs").hidden = true;
+  $("forgot-password-button").hidden = true;
+  $("forgot-password-form").hidden = false;
+  $("forgot-email").value = $("auth-email").value;
+  $("forgot-message").textContent = "";
+  $("forgot-error").hidden = true;
+});
+$("forgot-back-button").addEventListener("click", () => {
+  $("forgot-password-form").hidden = true;
+  $("auth-form").hidden = false;
+  $("auth-tabs").hidden = false;
+  $("forgot-password-button").hidden = false;
+});
+$("forgot-password-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("forgot-password-form").querySelector('button[type="submit"]');
+  button.disabled = true;
+  $("forgot-error").hidden = true;
+  $("forgot-message").textContent = "";
+  try {
+    const result = await fetchJson("/auth/forgot-password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: $("forgot-email").value }),
+    });
+    $("forgot-message").textContent = result.message;
+  } catch (error) {
+    $("forgot-error").textContent = error.message;
+    $("forgot-error").hidden = false;
+  } finally {
+    button.disabled = false;
+  }
+});
+$("reset-password-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("reset-password-form").querySelector('button[type="submit"]');
+  button.disabled = true;
+  $("reset-error").hidden = true;
+  try {
+    const result = await fetchJson("/auth/reset-password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token: new URLSearchParams(location.search).get("reset"),
+        password: $("new-password").value,
+      }),
+    });
+    history.replaceState({}, "", "/");
+    $("new-password").value = "";
+    $("reset-password-form").hidden = true;
+    $("auth-form").hidden = false;
+    $("auth-tabs").hidden = false;
+    $("forgot-password-button").hidden = false;
+    $("auth-hint").textContent = result.message;
+  } catch (error) {
+    $("reset-error").textContent = error.message;
+    $("reset-error").hidden = false;
+  } finally {
+    button.disabled = false;
+  }
+});
 $("auth-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const submit = $("auth-submit");
@@ -1905,7 +2524,15 @@ if (new URLSearchParams(location.search).has("connected")) {
 async function initialize() {
   try {
     await loadCsrfToken();
-    await loadStatus();
+    if (new URLSearchParams(location.search).has("reset")) {
+      $("auth-tabs").hidden = true;
+      $("auth-form").hidden = true;
+      $("forgot-password-button").hidden = true;
+      $("reset-password-form").hidden = false;
+      $("new-password").focus();
+    } else {
+      await loadStatus();
+    }
   } catch (error) {
     $("auth-error").textContent = error.message;
     $("auth-error").hidden = false;

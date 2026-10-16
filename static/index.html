@@ -27,7 +27,7 @@
   <div class="app-shell">
     <aside class="sidebar">
       <header class="topbar">
-        <a class="brand" href="/" aria-label="AMVelo home">
+        <a class="brand" id="brand" href="/" aria-label="AMVelo home" title="Tap three times for a surprise">
           <span class="brand-mark" aria-hidden="true">
             <svg viewBox="0 0 32 32" fill="none"><circle cx="8" cy="22" r="5.5"/><circle cx="24" cy="22" r="5.5"/><path d="m8 22 6-10 6 10H8Zm6-10h5m-3 0 8 10"/></svg>
           </span>
@@ -47,7 +47,7 @@
         <div class="eyebrow"><span class="live-dot"></span> PRIVATE BY DESIGN</div>
         <h1>Your rides<br>stay yours<span class="brand-period">.</span></h1>
         <p class="intro">Sign in to your private cycling space, or create an account. Only you can see the rides saved to your account.</p>
-        <div class="auth-tabs" role="tablist" aria-label="Account access">
+        <div class="auth-tabs" id="auth-tabs" role="tablist" aria-label="Account access">
           <button class="auth-tab active" id="login-tab" type="button" role="tab" aria-selected="true">Sign in</button>
           <button class="auth-tab" id="register-tab" type="button" role="tab" aria-selected="false">Create account</button>
         </div>
@@ -60,6 +60,25 @@
           <p class="auth-error" id="auth-error" aria-live="polite" hidden></p>
           <button class="primary-button" id="auth-submit" type="submit"><span>Sign in</span><span aria-hidden="true">↗</span></button>
         </form>
+        <button class="auth-link" id="forgot-password-button" type="button">Forgot password?</button>
+        <form id="forgot-password-form" hidden>
+          <h2>Reset your password</h2>
+          <p class="intro">Enter your account email and we’ll send a secure reset link if it exists.</p>
+          <label class="field-label" for="forgot-email">EMAIL</label>
+          <input class="auth-input" id="forgot-email" type="email" autocomplete="email" maxlength="254" required>
+          <p class="auth-error" id="forgot-error" aria-live="polite" hidden></p>
+          <p class="auth-hint" id="forgot-message" aria-live="polite"></p>
+          <button class="primary-button" type="submit"><span>Send reset link</span><span aria-hidden="true">↗</span></button>
+          <button class="auth-link" id="forgot-back-button" type="button">Back to sign in</button>
+        </form>
+        <form id="reset-password-form" hidden>
+          <h2>Choose a new password</h2>
+          <p class="intro">Use at least 12 characters. This reset link can only be used once.</p>
+          <label class="field-label" for="new-password">NEW PASSWORD</label>
+          <input class="auth-input" id="new-password" type="password" autocomplete="new-password" minlength="12" maxlength="256" required>
+          <p class="auth-error" id="reset-error" aria-live="polite" hidden></p>
+          <button class="primary-button" type="submit"><span>Reset password</span><span aria-hidden="true">↗</span></button>
+        </form>
       </section>
       <div class="account-bar" id="account-bar" hidden>
         <span>PRIVATE ACCOUNT · <strong id="account-email"></strong></span>
@@ -70,6 +89,12 @@
       </div>
 
       <div class="private-content" id="private-content" hidden>
+      <nav class="workspace-tabs" role="tablist" aria-label="Your AMVelo sections">
+        <button type="button" role="tab" id="planner-tab" class="workspace-tab active" data-view="planner-view" aria-controls="planner-view" aria-selected="true">Plan ride</button>
+        <button type="button" role="tab" id="stats-tab" class="workspace-tab" data-view="stats-view" aria-controls="stats-view" aria-selected="false">My stats</button>
+        <button type="button" role="tab" id="explore-tab" class="workspace-tab" data-view="explore-view" aria-controls="explore-view" aria-selected="false">Explore</button>
+      </nav>
+      <div class="tab-view active" id="planner-view" role="tabpanel" aria-labelledby="planner-tab">
       <section class="welcome">
         <div class="eyebrow"><span class="live-dot"></span> YOUR OWN PACE, YOUR OWN MAP</div>
         <h1>Where to<br>next<span class="brand-period">?</span></h1>
@@ -83,6 +108,7 @@
           <input id="origin-input" type="search" placeholder="Choose a departure point" autocomplete="off">
           <button class="field-action" id="location-button" type="button" aria-label="Use my current location" title="Use my current location">◎</button>
           <button class="field-action" data-pick-map="origin" type="button" aria-label="Pick departure point on map" title="Pick departure point on map">⌖</button>
+          <button class="favorite-save" id="save-origin-favorite" type="button" aria-label="Save departure as a favorite" title="Save departure as a favorite" hidden>☆</button>
           <button class="clear-button" id="clear-origin" type="button" aria-label="Clear departure point" hidden>×</button>
         </div>
         <ul class="suggestions" id="origin-suggestions" role="listbox" hidden></ul>
@@ -91,9 +117,14 @@
           <span class="destination-dot" aria-hidden="true"></span>
           <input id="destination-input" type="search" placeholder="Choose an arrival point" autocomplete="off">
           <button class="field-action" data-pick-map="destination" type="button" aria-label="Pick arrival point on map" title="Pick arrival point on map">⌖</button>
+          <button class="favorite-save" id="save-destination-favorite" type="button" aria-label="Save arrival as a favorite" title="Save arrival as a favorite" hidden>☆</button>
           <button class="clear-button" id="clear-destination" type="button" aria-label="Clear arrival point" hidden>×</button>
         </div>
         <ul class="suggestions" id="suggestions" role="listbox" hidden></ul>
+        <section class="favorites-panel" id="favorites-panel" hidden>
+          <div class="section-title"><span>FAVORITE PLACES</span></div>
+          <div id="favorite-places-list"></div>
+        </section>
         <div class="stop-list" id="stop-list"></div>
         <button class="add-stop-button" id="add-stop-button" type="button">+ Add a stop</button>
         <label class="field-label schedule-label" id="departure-label" for="departure-date">DEPARTURE TIME</label>
@@ -164,6 +195,11 @@
         <p class="estimate-note" id="estimate-note">Ride time uses your imported Strava moving speeds and the route distance; it excludes breaks and traffic.</p>
         <div class="route-option-heading"><span>ROUTE OPTIONS</span><span>Bike-route alternatives</span></div>
         <div class="route-options" id="route-options" role="group" aria-label="Route options"></div>
+        <section class="route-gradient" id="route-gradient" hidden aria-label="Route elevation profile">
+          <div class="section-title"><span>ROUTE GRADIENT</span><span id="gradient-summary">—</span></div>
+          <div class="gradient-chart" id="gradient-chart"></div>
+          <div class="gradient-legend"><span><i class="gradient-up-key"></i><b id="gradient-max-uphill">Uphill</b></span><span><i class="gradient-down-key"></i><b id="gradient-max-downhill">Downhill</b></span></div>
+        </section>
         <p class="estimate-note" id="route-road-note">The quieter-roads option favors routes with the least distance on signed M, N, and R roads; a short main-road link may still be needed.</p>
         <button class="navigate-button" id="start-navigation" type="button">
           <span class="navigate-button-icon" aria-hidden="true">➤</span>
@@ -213,6 +249,58 @@
       </section>
       </div>
 
+      <section class="tab-view stats-view" id="stats-view" role="tabpanel" aria-labelledby="stats-tab" hidden>
+        <div class="section-title"><span>YOUR RIDING LIFE</span><span id="stats-updated">—</span></div>
+        <div class="bike-profile-card">
+          <svg class="bike-profile-image" id="bike-profile-image" viewBox="0 0 120 70" role="img" aria-label="Bike illustration">
+            <circle cx="25" cy="48" r="17"></circle><circle cx="95" cy="48" r="17"></circle>
+            <path d="M25 48 44 20l19 28H25Zm19-28h14m-6 0 24 28M39 20h-9m34 28h-8"></path>
+          </svg>
+          <div><strong id="bike-summary">Choose your bike</strong><span>A little detail for your ride stats</span></div>
+        </div>
+        <form class="bike-profile-form" id="bike-profile-form">
+          <label class="field-label" for="bike-type">BIKE TYPE</label>
+          <select class="schedule-input" id="bike-type">
+            <option value="road">Road bike</option>
+            <option value="gravel">Gravel bike</option>
+            <option value="mountain">Mountain bike</option>
+            <option value="electric">E-bike</option>
+            <option value="city">City / hybrid bike</option>
+            <option value="other">Other</option>
+          </select>
+          <label class="field-label schedule-label" for="bike-model">MAKE / MODEL</label>
+          <input class="auth-input" id="bike-model" type="text" maxlength="80" placeholder="e.g. Trek Domane">
+          <button class="archive-button" type="submit">Save bike</button>
+          <p class="schedule-hint" id="bike-profile-message" aria-live="polite"></p>
+        </form>
+        <div class="personal-stats-grid" id="personal-stats-grid"></div>
+        <div class="section-title yearly-heading"><span>YEAR BY YEAR</span></div>
+        <div class="yearly-stats" id="yearly-stats"></div>
+        <div class="section-title yearly-heading"><span>LONGEST RIDES</span></div>
+        <div class="longest-rides" id="longest-rides"></div>
+      </section>
+
+      <section class="tab-view explore-view" id="explore-view" role="tabpanel" aria-labelledby="explore-tab" hidden>
+        <div class="eyebrow"><span class="live-dot"></span> PERSONALIZED DISTANCE</div>
+        <h2>How far can you ride?</h2>
+        <p class="intro">Find nearby places you can ride to and return from within your time budget, using your typical Strava pace.</p>
+        <label class="field-label schedule-label" for="explore-duration">TOTAL TIME FOR THE ROUND TRIP</label>
+        <select class="schedule-input" id="explore-duration">
+          <option value="60">1 hour</option>
+          <option value="90">1 hour 30 minutes</option>
+          <option value="120" selected>2 hours</option>
+          <option value="180">3 hours</option>
+          <option value="240">4 hours</option>
+          <option value="360">6 hours</option>
+          <option value="480">8 hours</option>
+          <option value="720">12 hours</option>
+        </select>
+        <button class="primary-button explore-button" id="explore-button" type="button" disabled><span>Find reachable places</span><span aria-hidden="true">↗</span></button>
+        <p class="form-hint" id="explore-hint">Choose a departure point on the Plan ride tab first.</p>
+        <div class="explore-results" id="explore-results"></div>
+      </section>
+      </div>
+
       <footer class="sidebar-footer">
         <span>MADE FOR THE LONG WAY ROUND</span>
         <button id="privacy-button" type="button">Privacy &amp; setup</button>
@@ -243,6 +331,7 @@
       </button>
       <div class="map-legend"><span class="legend-mark"></span><span>YOUR RIDES</span><span class="legend-divider"></span><span class="legend-route"></span><span>PLANNED ROUTE</span><span class="legend-divider"></span><span class="greenway-key legend-greenway"></span><span>GREENWAYS</span></div>
       <div class="map-attribution">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a> · Routing by OpenStreetMap · Greenway data © OSM</div>
+      <div class="aircraft-attribution" id="aircraft-attribution" hidden>Live aircraft data · ADSB.lol</div>
       <section class="navigation-ui" id="navigation-ui" aria-label="Bike navigation" hidden>
         <div class="navigation-guidance">
           <button class="navigation-exit" id="end-navigation" type="button" aria-label="End navigation">×</button>
@@ -265,10 +354,15 @@
             </div>
           </div>
           <div class="navigation-route-progress"><span id="navigation-progress"></span></div>
+          <div class="navigation-deadline" id="navigation-deadline" hidden>
+            <span>PACE TO BE HOME ON TIME</span><strong id="navigation-required-speed">—</strong>
+            <small id="navigation-deadline-detail"></small>
+          </div>
           <div class="navigation-dashboard-bottom">
             <span id="navigation-location-status">Waiting for GPS signal…</span>
             <button id="navigation-recenter" type="button">Recenter</button>
           </div>
+          <button class="navigation-return-button" id="navigation-return-button" type="button" hidden>Navigate the return leg</button>
         </div>
       </section>
     </main>

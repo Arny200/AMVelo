@@ -12,6 +12,7 @@ import math
 import os
 import re
 import secrets
+import smtplib
 import sqlite3
 import statistics
 import threading
@@ -19,6 +20,7 @@ import zipfile
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
@@ -115,6 +117,8 @@ import_locks: dict[int, threading.Lock] = {}
 import_locks_guard = threading.Lock()
 login_attempts: dict[str, list[float]] = {}
 login_attempts_guard = threading.Lock()
+aircraft_request_times: dict[str, float] = {}
+aircraft_request_guard = threading.Lock()
 
 
 def utc_now() -> str:
@@ -182,7 +186,50 @@ def initialize_database() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS password_reset_attempts (
+                attempt_key TEXT NOT NULL,
+                attempted_at INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS favorite_places (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                label TEXT NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (user_id, label, latitude, longitude)
+            )
+            """
+        )
+        _ensure_column(connection, "users", "bike_type", "TEXT NOT NULL DEFAULT 'road'")
+        _ensure_column(connection, "users", "bike_model", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "users", "auth_version", "INTEGER NOT NULL DEFAULT 0")
         _migrate_legacy_data(connection)
+
+
+def _ensure_column(
+    connection: sqlite3.Connection, table: str, name: str, definition: str
+) -> None:
+    columns = {
+        row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+    }
+    if name not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def _migrate_legacy_data(connection: sqlite3.Connection) -> None:
@@ -236,7 +283,14 @@ def get_user(user_id: int) -> sqlite3.Row | None:
 
 def current_user_id() -> int | None:
     user_id = session.get("user_id")
-    return int(user_id) if isinstance(user_id, int) else None
+    auth_version = session.get("auth_version")
+    if not isinstance(user_id, int) or not isinstance(auth_version, int):
+        return None
+    user = get_user(user_id)
+    if user is None or int(user["auth_version"]) != auth_version:
+        session.clear()
+        return None
+    return user_id
 
 
 def login_required(function: Callable[..., Any]) -> Callable[..., Any]:
@@ -1033,7 +1087,7 @@ def sample_route_coordinates(
     ]
 
 
-def route_elevation(coordinates: list[list[float]]) -> dict[str, int] | None:
+def route_elevation(coordinates: list[list[float]]) -> dict[str, Any] | None:
     samples = sample_route_coordinates(coordinates)
     if len(samples) < 2:
         return None
@@ -1046,7 +1100,7 @@ def route_elevation(coordinates: list[list[float]]) -> dict[str, int] | None:
             },
             headers={"User-Agent": "AMVelo/1.0"},
         )
-    except (HTTPError, URLError, TimeoutError):
+    except (HTTPError, URLError, TimeoutError, ValueError):
         logger.exception("Could not retrieve elevation samples for a bike route")
         return None
     if not isinstance(result, dict):
@@ -1058,13 +1112,39 @@ def route_elevation(coordinates: list[list[float]]) -> dict[str, int] | None:
         or any(not isinstance(value, (int, float)) for value in elevations)
     ):
         return None
-    ascent = sum(
-        max(0.0, float(current) - float(previous))
-        for previous, current in zip(elevations, elevations[1:])
-    )
+    cumulative_distances = [0.0]
+    for previous, current in zip(samples, samples[1:]):
+        cumulative_distances.append(
+            cumulative_distances[-1]
+            + distance_between_points(
+                (float(previous[1]), float(previous[0])),
+                (float(current[1]), float(current[0])),
+            )
+        )
+    ascent = 0.0
+    descent = 0.0
+    profile: list[dict[str, float]] = []
+    for index, elevation in enumerate(elevations):
+        gradient = 0.0
+        if index < len(elevations) - 1:
+            distance = cumulative_distances[index + 1] - cumulative_distances[index]
+            elevation_change = float(elevations[index + 1]) - float(elevation)
+            if distance > 0:
+                gradient = elevation_change / distance * 100
+            ascent += max(0.0, elevation_change)
+            descent += max(0.0, -elevation_change)
+        profile.append(
+            {
+                "distance_km": round(cumulative_distances[index] / 1000, 2),
+                "elevation_m": round(float(elevation), 1),
+                "gradient_percent": round(gradient, 1),
+            }
+        )
     return {
         "elevation_gain_m": round(ascent),
+        "elevation_loss_m": round(descent),
         "highest_elevation_m": round(max(float(value) for value in elevations)),
+        "profile": profile,
     }
 
 
@@ -1149,6 +1229,82 @@ def validate_credentials(body: Any) -> tuple[str, str] | None:
     return email, password
 
 
+def mail_reset_configuration() -> dict[str, Any] | None:
+    host = os.environ.get("SMTP_HOST", "").strip()
+    sender = os.environ.get("SMTP_FROM", "").strip()
+    if not host or not sender:
+        return None
+    public_base_url = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if public_deployment and (
+        not public_base_url.startswith("https://")
+        or urlsplit(public_base_url).netloc == ""
+    ):
+        return None
+    return {
+        "host": host,
+        "port": int(os.environ.get("SMTP_PORT", "587")),
+        "username": os.environ.get("SMTP_USERNAME", ""),
+        "password": os.environ.get("SMTP_PASSWORD", ""),
+        "sender": sender,
+        "use_tls": os.environ.get("SMTP_USE_TLS", "true").lower()
+        in {"1", "true", "yes"},
+        "base_url": public_base_url or request.url_root.rstrip("/"),
+    }
+
+
+def send_password_reset_email(recipient: str, token: str) -> None:
+    config = mail_reset_configuration()
+    if config is None:
+        raise RuntimeError(
+            "Password reset email is not configured. Set SMTP_HOST, SMTP_FROM, "
+            "and PUBLIC_BASE_URL for a public deployment."
+        )
+    message = EmailMessage()
+    message["Subject"] = "Reset your AMVelo password"
+    message["From"] = config["sender"]
+    message["To"] = recipient
+    reset_url = f"{config['base_url']}/?reset={token}"
+    message.set_content(
+        "We received a request to reset the password for your AMVelo account.\n\n"
+        f"Choose a new password using this one-time link (valid for 30 minutes):\n{reset_url}\n\n"
+        "If you did not request this, you can ignore this email."
+    )
+    if config["use_tls"]:
+        with smtplib.SMTP(config["host"], config["port"], timeout=15) as server:
+            server.starttls()
+            if config["username"]:
+                server.login(config["username"], config["password"])
+            server.send_message(message)
+    else:
+        if public_deployment:
+            raise RuntimeError("Public password-reset email must use SMTP TLS.")
+        with smtplib.SMTP(config["host"], config["port"], timeout=15) as server:
+            if config["username"]:
+                server.login(config["username"], config["password"])
+            server.send_message(message)
+
+
+def password_reset_rate_limited(rate_key: str) -> bool:
+    cutoff = int(datetime.now(timezone.utc).timestamp()) - 3600
+    with connect_db() as connection:
+        connection.execute(
+            "DELETE FROM password_reset_attempts WHERE attempted_at < ?", (cutoff,)
+        )
+        count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM password_reset_attempts WHERE attempt_key = ?",
+                (rate_key,),
+            ).fetchone()[0]
+        )
+        if count >= 3:
+            return True
+        connection.execute(
+            "INSERT INTO password_reset_attempts (attempt_key, attempted_at) VALUES (?, ?)",
+            (rate_key, int(datetime.now(timezone.utc).timestamp())),
+        )
+    return False
+
+
 @app.before_request
 def protect_requests():
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.path != "/webhooks/strava":
@@ -1180,6 +1336,78 @@ def home():
 @app.get("/healthz")
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.get("/api/aircraft")
+def api_aircraft():
+    try:
+        latitude = float(request.args.get("lat", ""))
+        longitude = float(request.args.get("lon", ""))
+        radius_nm = float(request.args.get("radius_nm", ""))
+    except (TypeError, ValueError):
+        return error_response("Choose a valid map area to view aircraft.", 400)
+    if (
+        not 51 <= latitude <= 56
+        or not -12 <= longitude <= -4.5
+        or not 5 <= radius_nm <= 120
+    ):
+        return error_response("Aircraft coverage is limited to map areas near Ireland.", 400)
+    now = datetime.now(timezone.utc).timestamp()
+    request_key = hashlib.sha256(
+        f"{request.remote_addr or ''}".encode()
+    ).hexdigest()
+    with aircraft_request_guard:
+        aircraft_request_times.update(
+            {
+                key: timestamp
+                for key, timestamp in aircraft_request_times.items()
+                if now - timestamp < 600
+            }
+        )
+        previous = aircraft_request_times.get(request_key)
+        if previous is not None and now - previous < 5:
+            return error_response("Aircraft data was just refreshed. Try again shortly.", 429)
+        aircraft_request_times[request_key] = now
+    try:
+        result = request_json(
+            f"https://api.adsb.lol/v2/lat/{latitude:.4f}/lon/{longitude:.4f}/dist/{round(radius_nm)}",
+            headers={"User-Agent": "AMVelo/1.0 (live aircraft map)"},
+        )
+    except (HTTPError, URLError, TimeoutError, ValueError) as error:
+        logger.exception("Could not retrieve live aircraft for the map")
+        return error_response(f"Live aircraft data is unavailable: {error}", 502)
+    if not isinstance(result, dict) or not isinstance(result.get("ac"), list):
+        return error_response("The aircraft data service returned an invalid response.", 502)
+    aircraft: list[dict[str, Any]] = []
+    for plane in result["ac"]:
+        if not isinstance(plane, dict):
+            continue
+        try:
+            plane_latitude = float(plane["lat"])
+            plane_longitude = float(plane["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (51 <= plane_latitude <= 56 and -12 <= plane_longitude <= -4.5):
+            continue
+        altitude = plane.get("alt_baro")
+        speed = plane.get("gs")
+        aircraft.append(
+            {
+                "hex": str(plane.get("hex") or "")[:16],
+                "callsign": str(plane.get("flight") or "").strip()[:24],
+                "registration": str(plane.get("r") or "")[:24],
+                "type": str(plane.get("t") or "")[:24],
+                "altitude_ft": altitude if isinstance(altitude, (int, float)) else None,
+                "speed_kt": speed if isinstance(speed, (int, float)) else None,
+                "track": plane.get("track") if isinstance(plane.get("track"), (int, float)) else None,
+                "lat": plane_latitude,
+                "lon": plane_longitude,
+                "on_ground": altitude == "ground",
+            }
+        )
+    response = jsonify({"aircraft": aircraft[:120], "source": "ADSB.lol"})
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/api/csrf")
@@ -1217,6 +1445,7 @@ def register():
     record_failed_login(rate_key)
     session.clear()
     session["user_id"] = user_id
+    session["auth_version"] = 0
     session["csrf_token"] = secrets.token_urlsafe(32)
     session.permanent = True
     response = jsonify(
@@ -1228,6 +1457,112 @@ def register():
     )
     response.headers["Cache-Control"] = "no-store"
     return response, 201
+
+
+@app.post("/auth/forgot-password")
+def forgot_password():
+    body = request.get_json(silent=True)
+    email = body.get("email") if isinstance(body, dict) else None
+    if not isinstance(email, str) or len(email) > 254:
+        return error_response("Enter the email address for your account.", 400)
+    email = email.strip().casefold()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        return error_response("Enter a valid email address.", 400)
+    rate_key = hashlib.sha256(
+        f"password-reset:{request.remote_addr}".encode()
+    ).hexdigest()
+    if password_reset_rate_limited(rate_key):
+        return error_response(
+            "Too many reset requests. Try again in an hour.", 429
+        )
+    mail_config = mail_reset_configuration()
+    if mail_config is None:
+        return error_response(
+            "Password reset email is not configured. The site administrator must "
+            "configure secure outgoing email before password resets can be sent.",
+            503,
+        )
+    with connect_db() as connection:
+        user = connection.execute(
+            "SELECT id, email FROM users WHERE email = ?", (email,)
+        ).fetchone()
+    if user:
+        token = secrets.token_urlsafe(32)
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+        with connect_db() as connection:
+            connection.execute(
+                """
+                INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    token_hash = excluded.token_hash,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    user["id"],
+                    hashlib.sha256(token.encode()).hexdigest(),
+                    expires_at,
+                ),
+            )
+        try:
+            send_password_reset_email(str(user["email"]), token)
+        except (OSError, smtplib.SMTPException, RuntimeError, ValueError) as error:
+            with connect_db() as connection:
+                connection.execute(
+                    "DELETE FROM password_reset_tokens WHERE user_id = ?",
+                    (user["id"],),
+                )
+            logger.exception("Could not send a password-reset email")
+            return error_response(
+                f"Could not send the password-reset email: {error}", 502
+            )
+    return jsonify(
+        {
+            "message": "If an account uses that email address, a password-reset link has been sent."
+        }
+    )
+
+
+@app.post("/auth/reset-password")
+def reset_password():
+    body = request.get_json(silent=True)
+    token = body.get("token") if isinstance(body, dict) else None
+    password = body.get("password") if isinstance(body, dict) else None
+    if (
+        not isinstance(token, str)
+        or len(token) > 256
+        or not isinstance(password, str)
+        or len(password) < 12
+        or len(password) > 256
+    ):
+        return error_response(
+            "Use a valid reset link and a new password of at least 12 characters.",
+            400,
+        )
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    now = datetime.now(timezone.utc).isoformat()
+    with connect_db() as connection:
+        reset = connection.execute(
+            """
+            SELECT user_id FROM password_reset_tokens
+            WHERE token_hash = ? AND expires_at > ?
+            """,
+            (token_hash, now),
+        ).fetchone()
+        if reset is None:
+            return error_response(
+                "This password-reset link has expired or has already been used. Request a new one.",
+                400,
+            )
+        connection.execute(
+            "UPDATE users SET password_hash = ?, auth_version = auth_version + 1 WHERE id = ?",
+            (generate_password_hash(password), reset["user_id"]),
+        )
+        connection.execute(
+            "DELETE FROM password_reset_tokens WHERE user_id = ?",
+            (reset["user_id"],),
+        )
+    return jsonify({"message": "Your password has been reset. Sign in with your new password."})
 
 
 @app.post("/auth/login")
@@ -1246,6 +1581,7 @@ def login():
         return error_response("Email or password is incorrect.", 401)
     session.clear()
     session["user_id"] = int(user["id"])
+    session["auth_version"] = int(user["auth_version"])
     session["csrf_token"] = secrets.token_urlsafe(32)
     session.permanent = True
     response = jsonify(
@@ -1299,6 +1635,8 @@ def api_status():
             if moving_time
             else None,
             "personal_speed_kmh": round(speed * 3.6, 1) if speed else None,
+            "bike_type": user["bike_type"],
+            "bike_model": user["bike_model"],
             "last_sync_at": user["last_sync_at"] or None,
             "sync_state": user["sync_state"],
             "sync_error": user["sync_error"],
@@ -1307,6 +1645,336 @@ def api_status():
             "import_error": user["import_error"],
         }
     )
+
+
+@app.get("/api/stats")
+@login_required
+def api_stats():
+    with connect_db() as connection:
+        summary = connection.execute(
+            """
+            SELECT COUNT(*) AS ride_count,
+                   COALESCE(SUM(distance), 0) AS distance_m,
+                   COALESCE(SUM(moving_time), 0) AS moving_time,
+                   COALESCE(SUM(elevation_gain), 0) AS elevation_gain_m,
+                   MAX(distance) AS longest_distance_m,
+                   MAX(average_speed) AS max_average_speed
+            FROM activities WHERE user_id = ?
+            """,
+            (g.user_id,),
+        ).fetchone()
+        yearly = connection.execute(
+            """
+            SELECT substr(start_date, 1, 4) AS year,
+                   COUNT(*) AS ride_count,
+                   COALESCE(SUM(distance), 0) AS distance_m,
+                   COALESCE(SUM(moving_time), 0) AS moving_time,
+                   COALESCE(SUM(elevation_gain), 0) AS elevation_gain_m
+            FROM activities
+            WHERE user_id = ? AND substr(start_date, 1, 4) GLOB '[0-9][0-9][0-9][0-9]'
+            GROUP BY year ORDER BY year
+            """,
+            (g.user_id,),
+        ).fetchall()
+        activity_types = connection.execute(
+            """
+            SELECT activity_type, COUNT(*) AS ride_count,
+                   COALESCE(SUM(distance), 0) AS distance_m
+            FROM activities WHERE user_id = ?
+            GROUP BY activity_type ORDER BY ride_count DESC
+            """,
+            (g.user_id,),
+        ).fetchall()
+        best_rides = connection.execute(
+            """
+            SELECT name, distance, moving_time, average_speed, elevation_gain, start_date
+            FROM activities WHERE user_id = ?
+            ORDER BY distance DESC LIMIT 5
+            """,
+            (g.user_id,),
+        ).fetchall()
+    total_distance = float(summary["distance_m"])
+    moving_time = int(summary["moving_time"])
+    return jsonify(
+        {
+            "ride_count": int(summary["ride_count"]),
+            "distance_km": round(total_distance / 1000, 1),
+            "moving_hours": round(moving_time / 3600, 1),
+            "elevation_gain_m": round(float(summary["elevation_gain_m"])),
+            "average_speed_kmh": round(total_distance / moving_time * 3.6, 1)
+            if moving_time
+            else None,
+            "longest_ride_km": round(float(summary["longest_distance_m"] or 0) / 1000, 1),
+            "fastest_average_kmh": round(float(summary["max_average_speed"] or 0) * 3.6, 1),
+            "yearly": [
+                {
+                    "year": row["year"],
+                    "ride_count": int(row["ride_count"]),
+                    "distance_km": round(float(row["distance_m"]) / 1000, 1),
+                    "moving_hours": round(int(row["moving_time"]) / 3600, 1),
+                    "elevation_gain_m": round(float(row["elevation_gain_m"])),
+                }
+                for row in yearly
+            ],
+            "activity_types": [
+                {
+                    "type": row["activity_type"],
+                    "ride_count": int(row["ride_count"]),
+                    "distance_km": round(float(row["distance_m"]) / 1000, 1),
+                }
+                for row in activity_types
+            ],
+            "longest_rides": [
+                {
+                    "name": decrypt_private_data(row["name"]),
+                    "distance_km": round(float(row["distance"]) / 1000, 1),
+                    "moving_time": int(row["moving_time"]),
+                    "average_speed_kmh": round(float(row["average_speed"]) * 3.6, 1),
+                    "elevation_gain_m": round(float(row["elevation_gain"])),
+                    "start_date": row["start_date"],
+                }
+                for row in best_rides
+            ],
+        }
+    )
+
+
+@app.put("/api/profile")
+@login_required
+def api_update_profile():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return error_response("Send your bike type and model as JSON.", 400)
+    bike_type = body.get("bike_type")
+    bike_model = body.get("bike_model", "")
+    valid_bike_types = {"road", "gravel", "mountain", "electric", "city", "other"}
+    if (
+        bike_type not in valid_bike_types
+        or not isinstance(bike_model, str)
+        or len(bike_model.strip()) > 80
+    ):
+        return error_response("Choose a bike type and enter a model under 80 characters.", 400)
+    with connect_db() as connection:
+        connection.execute(
+            "UPDATE users SET bike_type = ?, bike_model = ? WHERE id = ?",
+            (bike_type, bike_model.strip(), g.user_id),
+        )
+    return jsonify({"bike_type": bike_type, "bike_model": bike_model.strip()})
+
+
+@app.get("/api/favorites")
+@login_required
+def api_favorites():
+    with connect_db() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, label, latitude, longitude, created_at
+            FROM favorite_places WHERE user_id = ?
+            ORDER BY label COLLATE NOCASE LIMIT 100
+            """,
+            (g.user_id,),
+        ).fetchall()
+    return jsonify(
+        [
+            {
+                "id": int(row["id"]),
+                "label": row["label"],
+                "lat": float(row["latitude"]),
+                "lon": float(row["longitude"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+    )
+
+
+@app.post("/api/favorites")
+@login_required
+def api_add_favorite():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return error_response("Choose a place to save.", 400)
+    label = body.get("label")
+    try:
+        latitude = float(body["lat"])
+        longitude = float(body["lon"])
+    except (KeyError, TypeError, ValueError):
+        return error_response("Choose a valid point on the map.", 400)
+    if (
+        not isinstance(label, str)
+        or not label.strip()
+        or len(label.strip()) > 120
+        or not is_on_ireland_island(latitude, longitude)
+    ):
+        return error_response("Enter a place name and choose a point in Ireland.", 400)
+    with connect_db() as connection:
+        existing = connection.execute(
+            """
+            SELECT id FROM favorite_places
+            WHERE user_id = ? AND label = ? AND latitude = ? AND longitude = ?
+            """,
+            (g.user_id, label.strip(), latitude, longitude),
+        ).fetchone()
+        if existing:
+            return error_response("That place is already in your favourites.", 409)
+        cursor = connection.execute(
+            """
+            INSERT INTO favorite_places (user_id, label, latitude, longitude, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (g.user_id, label.strip(), latitude, longitude, utc_now()),
+        )
+        favorite_id = int(cursor.lastrowid)
+    return jsonify(
+        {
+            "id": favorite_id,
+            "label": label.strip(),
+            "lat": latitude,
+            "lon": longitude,
+        }
+    ), 201
+
+
+@app.delete("/api/favorites/<int:favorite_id>")
+@login_required
+def api_delete_favorite(favorite_id: int):
+    with connect_db() as connection:
+        deleted = connection.execute(
+            "DELETE FROM favorite_places WHERE id = ? AND user_id = ?",
+            (favorite_id, g.user_id),
+        ).rowcount
+    if not deleted:
+        return error_response("Favourite not found.", 404)
+    return jsonify({"deleted": True})
+
+
+@app.post("/api/reachable-places")
+@login_required
+def api_reachable_places():
+    body = request.get_json(silent=True)
+    try:
+        latitude = float(body["start"]["lat"])
+        longitude = float(body["start"]["lon"])
+        duration_minutes = int(body["duration_minutes"])
+    except (KeyError, TypeError, ValueError):
+        return error_response("Choose a departure point and a round-trip duration.", 400)
+    if not is_on_ireland_island(latitude, longitude):
+        return error_response("Choose a departure point on the island of Ireland.", 400)
+    if not 15 <= duration_minutes <= 720:
+        return error_response("Choose a round-trip duration between 15 minutes and 12 hours.", 400)
+    speed, _, _ = personal_speed(g.user_id)
+    if speed is None:
+        return error_response("Import Strava rides to personalize destination estimates.", 409)
+    search_radius_m = min(100_000, speed * duration_minutes * 60 / 2 * 0.9)
+    query = (
+        f'[out:json][timeout:20];node["place"~"city|town|village"]'
+        f"(around:{round(search_radius_m)},{latitude:.5f},{longitude:.5f});"
+        "out body;"
+    )
+    try:
+        place_result = request_json(
+            "https://overpass-api.de/api/interpreter",
+            method="POST",
+            form={"data": query},
+            headers={"User-Agent": "AMVelo/1.0 (personalized bike distance explorer)"},
+        )
+    except (HTTPError, URLError, TimeoutError, ValueError) as error:
+        logger.exception("Could not search nearby Irish towns for the duration explorer")
+        return error_response(f"Nearby place search is unavailable: {error}", 502)
+    if not isinstance(place_result, dict) or not isinstance(place_result.get("elements"), list):
+        return error_response("The nearby place search returned invalid data.", 502)
+    candidates: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for element in place_result["elements"]:
+        if not isinstance(element, dict):
+            continue
+        tags = element.get("tags") or {}
+        name = tags.get("name") if isinstance(tags, dict) else None
+        try:
+            place_latitude = float(element["lat"])
+            place_longitude = float(element["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or name.strip().casefold() in seen_names
+            or not is_on_ireland_island(place_latitude, place_longitude)
+        ):
+            continue
+        seen_names.add(name.strip().casefold())
+        candidates.append(
+            {
+                "label": name.strip(),
+                "lat": place_latitude,
+                "lon": place_longitude,
+                "straight_distance_m": distance_between_points(
+                    (latitude, longitude), (place_latitude, place_longitude)
+                ),
+            }
+        )
+    candidates = sorted(candidates, key=lambda place: place["straight_distance_m"])[:35]
+    if not candidates:
+        return jsonify({"places": [], "personal_speed_kmh": round(speed * 3.6, 1)})
+    coordinates = [(longitude, latitude)] + [
+        (place["lon"], place["lat"]) for place in candidates
+    ]
+    coordinate_path = ";".join(f"{lon},{lat}" for lon, lat in coordinates)
+    table_url = f"{BIKE_ROUTER.rsplit('/route/', 1)[0]}/table/v1/driving/{coordinate_path}"
+    try:
+        table_result = request_json(
+            table_url,
+            params={"annotations": "distance", "sources": "all", "destinations": "all"},
+            headers={"User-Agent": "AMVelo/1.0 (personalized bike distance explorer)"},
+        )
+    except (HTTPError, URLError, TimeoutError, ValueError) as error:
+        logger.exception("Could not calculate bicycle distances to nearby places")
+        return error_response(f"Nearby bicycle routes are unavailable: {error}", 502)
+    distances = table_result.get("distances") if isinstance(table_result, dict) else None
+    if (
+        not isinstance(distances, list)
+        or len(distances) != len(coordinates)
+        or any(not isinstance(row, list) or len(row) != len(coordinates) for row in distances)
+    ):
+        return error_response("The bicycle routing service returned incomplete place distances.", 502)
+    budget_seconds = duration_minutes * 60
+    places: list[dict[str, Any]] = []
+    for index, candidate in enumerate(candidates, start=1):
+        outbound_distance = distances[0][index]
+        return_distance = distances[index][0]
+        if not isinstance(outbound_distance, (int, float)) or not isinstance(
+            return_distance, (int, float)
+        ):
+            continue
+        outbound_distance = float(outbound_distance)
+        return_distance = float(return_distance)
+        estimated_seconds = round((outbound_distance + return_distance) / speed)
+        if estimated_seconds > budget_seconds:
+            continue
+        places.append(
+            {
+                "label": candidate["label"],
+                "lat": candidate["lat"],
+                "lon": candidate["lon"],
+                "outbound_km": round(outbound_distance / 1000, 1),
+                "return_km": round(return_distance / 1000, 1),
+                "round_trip_minutes": round(estimated_seconds / 60),
+                "time_remaining_minutes": max(
+                    0, duration_minutes - round(estimated_seconds / 60)
+                ),
+            }
+        )
+    places.sort(key=lambda place: (place["round_trip_minutes"], place["label"].casefold()))
+    response = jsonify(
+        {
+            "places": places[:20],
+            "personal_speed_kmh": round(speed * 3.6, 1),
+            "duration_minutes": duration_minutes,
+            "search_radius_km": round(search_radius_m / 1000, 1),
+        }
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.delete("/api/account")
@@ -1509,6 +2177,34 @@ def api_sync():
     return jsonify({"status": "syncing"}), 202
 
 
+@app.post("/api/elevation-profile")
+@login_required
+def api_elevation_profile():
+    body = request.get_json(silent=True)
+    coordinates = body.get("coordinates") if isinstance(body, dict) else None
+    if (
+        not isinstance(coordinates, list)
+        or not 2 <= len(coordinates) <= 20_000
+        or any(
+            not isinstance(point, list)
+            or len(point) < 2
+            or not all(
+                isinstance(value, (int, float)) and math.isfinite(value)
+                for value in point[:2]
+            )
+            or not is_on_ireland_island(float(point[1]), float(point[0]))
+            for point in coordinates
+        )
+    ):
+        return error_response("Choose a valid route on the island of Ireland.", 400)
+    metrics = route_elevation(coordinates)
+    if metrics is None:
+        return error_response("Route elevation is unavailable right now.", 502)
+    response = jsonify(metrics)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.post("/api/route")
 @login_required
 def api_route():
@@ -1596,7 +2292,9 @@ def api_route():
                 "personal_seconds": round(distance_m / speed),
                 "router_seconds": round(float(route.get("duration") or 0)),
                 "elevation_gain_m": metrics["elevation_gain_m"] if metrics else None,
+                "elevation_loss_m": metrics["elevation_loss_m"] if metrics else None,
                 "highest_elevation_m": metrics["highest_elevation_m"] if metrics else None,
+                "elevation_profile": metrics["profile"] if metrics else None,
                 "main_road_distance_m": route_main_road_distance(route),
                 "navigation_instructions": route_navigation_instructions(route),
             }

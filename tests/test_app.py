@@ -54,6 +54,12 @@ class AccountIsolationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 201, response.json)
         return response.json["csrf_token"]
 
+    def setUp(self) -> None:
+        with APPLICATION.login_attempts_guard:
+            APPLICATION.login_attempts.clear()
+        with APPLICATION.connect_db() as connection:
+            connection.execute("DELETE FROM auth_attempts")
+
     def test_anonymous_users_cannot_read_private_apis(self) -> None:
         client = APPLICATION.app.test_client()
         for endpoint in ("/api/status", "/api/activities"):
@@ -665,6 +671,178 @@ class AccountIsolationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("island of Ireland", response.json["error"])
         route_request.assert_not_called()
+
+    def test_personal_stats_bike_profile_and_favorites_are_account_scoped(self) -> None:
+        owner = APPLICATION.app.test_client()
+        other = APPLICATION.app.test_client()
+        owner_csrf = self.register(owner)
+        other_csrf = self.register(other)
+        with owner.session_transaction() as state:
+            owner_id = state["user_id"]
+        APPLICATION.save_activity(
+            owner_id,
+            {
+                "id": "stats-ride",
+                "type": "Ride",
+                "name": "Private coastal ride",
+                "distance": 20_000,
+                "moving_time": 3_600,
+                "average_speed": 20_000 / 3_600,
+                "total_elevation_gain": 250,
+                "start_date": "2025-05-01T10:00:00Z",
+                "map": {"summary_polyline": ""},
+            },
+        )
+
+        stats = owner.get("/api/stats")
+        self.assertEqual(stats.status_code, 200)
+        self.assertEqual(stats.json["ride_count"], 1)
+        self.assertEqual(stats.json["distance_km"], 20)
+        self.assertEqual(other.get("/api/stats").json["ride_count"], 0)
+
+        profile = owner.put(
+            "/api/profile",
+            json={"bike_type": "gravel", "bike_model": "Example Gravel"},
+            headers={"X-CSRF-Token": owner_csrf},
+        )
+        self.assertEqual(profile.status_code, 200)
+        self.assertEqual(profile.json["bike_model"], "Example Gravel")
+        self.assertEqual(owner.get("/api/status").json["bike_type"], "gravel")
+
+        favorite = owner.post(
+            "/api/favorites",
+            json={"label": "Cork", "lat": 51.90, "lon": -8.47},
+            headers={"X-CSRF-Token": owner_csrf},
+        )
+        self.assertEqual(favorite.status_code, 201)
+        self.assertEqual(owner.get("/api/favorites").json[0]["label"], "Cork")
+        self.assertEqual(other.get("/api/favorites").json, [])
+        self.assertEqual(
+            other.delete(
+                f"/api/favorites/{favorite.json['id']}",
+                headers={"X-CSRF-Token": other_csrf},
+            ).status_code,
+            404,
+        )
+        invalid_place = owner.post(
+            "/api/favorites",
+            json={"label": "London", "lat": 51.51, "lon": -0.13},
+            headers={"X-CSRF-Token": owner_csrf},
+        )
+        self.assertEqual(invalid_place.status_code, 400)
+
+    def test_elevation_profile_reports_ascent_descent_and_sample_gradients(self) -> None:
+        client = APPLICATION.app.test_client()
+        csrf = self.register(client)
+        coordinates = [[-6.26, 53.35], [-6.24, 53.36], [-6.22, 53.37]]
+        with patch.object(
+            APPLICATION, "request_json", return_value={"elevation": [100, 110, 90]}
+        ) as elevation_request:
+            response = client.post(
+                "/api/elevation-profile",
+                json={"coordinates": coordinates},
+                headers={"X-CSRF-Token": csrf},
+            )
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(response.json["elevation_gain_m"], 10)
+        self.assertEqual(response.json["elevation_loss_m"], 20)
+        self.assertEqual(len(response.json["profile"]), 3)
+        self.assertGreater(response.json["profile"][0]["gradient_percent"], 0)
+        self.assertLess(response.json["profile"][1]["gradient_percent"], 0)
+        elevation_request.assert_called_once()
+
+    def test_reachable_places_use_both_route_directions_and_personal_pace(self) -> None:
+        client = APPLICATION.app.test_client()
+        csrf = self.register(client)
+        with client.session_transaction() as state:
+            user_id = state["user_id"]
+        APPLICATION.save_activity(
+            user_id,
+            {
+                "id": "explorer-ride",
+                "type": "Ride",
+                "name": "Usual pace",
+                "distance": 20_000,
+                "moving_time": 3_600,
+                "average_speed": 20_000 / 3_600,
+                "start_date": "2025-05-01T10:00:00Z",
+                "map": {"summary_polyline": ""},
+            },
+        )
+        overpass = {
+            "elements": [
+                {"lat": 53.20, "lon": -6.10, "tags": {"name": "Bray", "place": "town"}}
+            ]
+        }
+        route_distances = {"distances": [[None, 10_000], [11_000, None]]}
+        with patch.object(
+            APPLICATION,
+            "request_json",
+            side_effect=[overpass, route_distances],
+        ) as requests:
+            response = client.post(
+                "/api/reachable-places",
+                json={
+                    "start": {"lat": 53.35, "lon": -6.26},
+                    "duration_minutes": 120,
+                },
+                headers={"X-CSRF-Token": csrf},
+            )
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(response.json["places"][0]["label"], "Bray")
+        self.assertEqual(response.json["places"][0]["outbound_km"], 10)
+        self.assertEqual(response.json["places"][0]["return_km"], 11)
+        self.assertEqual(requests.call_count, 2)
+
+    def test_password_reset_link_is_one_time_and_changes_password(self) -> None:
+        client = APPLICATION.app.test_client()
+        csrf = self.csrf(client)
+        email = f"{uuid.uuid4().hex}@example.test"
+        registration = client.post(
+            "/auth/register",
+            json={"email": email, "password": "private-test-password-123"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(registration.status_code, 201)
+        with patch.dict(
+            os.environ,
+            {"SMTP_HOST": "smtp.example.test", "SMTP_FROM": "AMVelo <reset@example.test>"},
+        ), patch.object(APPLICATION, "send_password_reset_email") as send_email:
+            requested = client.post(
+                "/auth/forgot-password",
+                json={"email": email},
+                headers={"X-CSRF-Token": registration.json["csrf_token"]},
+            )
+        self.assertEqual(requested.status_code, 200)
+        token = send_email.call_args.args[1]
+        reset = client.post(
+            "/auth/reset-password",
+            json={"token": token, "password": "new-private-test-password-456"},
+            headers={"X-CSRF-Token": registration.json["csrf_token"]},
+        )
+        self.assertEqual(reset.status_code, 200)
+        reused = client.post(
+            "/auth/reset-password",
+            json={"token": token, "password": "another-private-password-789"},
+            headers={"X-CSRF-Token": registration.json["csrf_token"]},
+        )
+        self.assertEqual(reused.status_code, 400)
+        self.assertEqual(client.get("/api/status").status_code, 401)
+
+        login_client = APPLICATION.app.test_client()
+        login_csrf = self.csrf(login_client)
+        old_password = login_client.post(
+            "/auth/login",
+            json={"email": email, "password": "private-test-password-123"},
+            headers={"X-CSRF-Token": login_csrf},
+        )
+        self.assertEqual(old_password.status_code, 401)
+        new_password = login_client.post(
+            "/auth/login",
+            json={"email": email, "password": "new-private-test-password-456"},
+            headers={"X-CSRF-Token": login_csrf},
+        )
+        self.assertEqual(new_password.status_code, 200)
 
 
 if __name__ == "__main__":
