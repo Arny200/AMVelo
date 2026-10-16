@@ -12,7 +12,6 @@ import math
 import os
 import re
 import secrets
-import smtplib
 import sqlite3
 import statistics
 import threading
@@ -20,7 +19,6 @@ import zipfile
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
@@ -188,23 +186,6 @@ def initialize_database() -> None:
         )
         connection.execute(
             """
-            CREATE TABLE IF NOT EXISTS password_reset_tokens (
-                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                token_hash TEXT NOT NULL UNIQUE,
-                expires_at TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS password_reset_attempts (
-                attempt_key TEXT NOT NULL,
-                attempted_at INTEGER NOT NULL
-            )
-            """
-        )
-        connection.execute(
-            """
             CREATE TABLE IF NOT EXISTS favorite_places (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -218,7 +199,6 @@ def initialize_database() -> None:
         )
         _ensure_column(connection, "users", "bike_type", "TEXT NOT NULL DEFAULT 'road'")
         _ensure_column(connection, "users", "bike_model", "TEXT NOT NULL DEFAULT ''")
-        _ensure_column(connection, "users", "auth_version", "INTEGER NOT NULL DEFAULT 0")
         _migrate_legacy_data(connection)
 
 
@@ -283,14 +263,7 @@ def get_user(user_id: int) -> sqlite3.Row | None:
 
 def current_user_id() -> int | None:
     user_id = session.get("user_id")
-    auth_version = session.get("auth_version")
-    if not isinstance(user_id, int) or not isinstance(auth_version, int):
-        return None
-    user = get_user(user_id)
-    if user is None or int(user["auth_version"]) != auth_version:
-        session.clear()
-        return None
-    return user_id
+    return int(user_id) if isinstance(user_id, int) else None
 
 
 def login_required(function: Callable[..., Any]) -> Callable[..., Any]:
@@ -1229,82 +1202,6 @@ def validate_credentials(body: Any) -> tuple[str, str] | None:
     return email, password
 
 
-def mail_reset_configuration() -> dict[str, Any] | None:
-    host = os.environ.get("SMTP_HOST", "").strip()
-    sender = os.environ.get("SMTP_FROM", "").strip()
-    if not host or not sender:
-        return None
-    public_base_url = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
-    if public_deployment and (
-        not public_base_url.startswith("https://")
-        or urlsplit(public_base_url).netloc == ""
-    ):
-        return None
-    return {
-        "host": host,
-        "port": int(os.environ.get("SMTP_PORT", "587")),
-        "username": os.environ.get("SMTP_USERNAME", ""),
-        "password": os.environ.get("SMTP_PASSWORD", ""),
-        "sender": sender,
-        "use_tls": os.environ.get("SMTP_USE_TLS", "true").lower()
-        in {"1", "true", "yes"},
-        "base_url": public_base_url or request.url_root.rstrip("/"),
-    }
-
-
-def send_password_reset_email(recipient: str, token: str) -> None:
-    config = mail_reset_configuration()
-    if config is None:
-        raise RuntimeError(
-            "Password reset email is not configured. Set SMTP_HOST, SMTP_FROM, "
-            "and PUBLIC_BASE_URL for a public deployment."
-        )
-    message = EmailMessage()
-    message["Subject"] = "Reset your AMVelo password"
-    message["From"] = config["sender"]
-    message["To"] = recipient
-    reset_url = f"{config['base_url']}/?reset={token}"
-    message.set_content(
-        "We received a request to reset the password for your AMVelo account.\n\n"
-        f"Choose a new password using this one-time link (valid for 30 minutes):\n{reset_url}\n\n"
-        "If you did not request this, you can ignore this email."
-    )
-    if config["use_tls"]:
-        with smtplib.SMTP(config["host"], config["port"], timeout=15) as server:
-            server.starttls()
-            if config["username"]:
-                server.login(config["username"], config["password"])
-            server.send_message(message)
-    else:
-        if public_deployment:
-            raise RuntimeError("Public password-reset email must use SMTP TLS.")
-        with smtplib.SMTP(config["host"], config["port"], timeout=15) as server:
-            if config["username"]:
-                server.login(config["username"], config["password"])
-            server.send_message(message)
-
-
-def password_reset_rate_limited(rate_key: str) -> bool:
-    cutoff = int(datetime.now(timezone.utc).timestamp()) - 3600
-    with connect_db() as connection:
-        connection.execute(
-            "DELETE FROM password_reset_attempts WHERE attempted_at < ?", (cutoff,)
-        )
-        count = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM password_reset_attempts WHERE attempt_key = ?",
-                (rate_key,),
-            ).fetchone()[0]
-        )
-        if count >= 3:
-            return True
-        connection.execute(
-            "INSERT INTO password_reset_attempts (attempt_key, attempted_at) VALUES (?, ?)",
-            (rate_key, int(datetime.now(timezone.utc).timestamp())),
-        )
-    return False
-
-
 @app.before_request
 def protect_requests():
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.path != "/webhooks/strava":
@@ -1445,7 +1342,6 @@ def register():
     record_failed_login(rate_key)
     session.clear()
     session["user_id"] = user_id
-    session["auth_version"] = 0
     session["csrf_token"] = secrets.token_urlsafe(32)
     session.permanent = True
     response = jsonify(
@@ -1457,112 +1353,6 @@ def register():
     )
     response.headers["Cache-Control"] = "no-store"
     return response, 201
-
-
-@app.post("/auth/forgot-password")
-def forgot_password():
-    body = request.get_json(silent=True)
-    email = body.get("email") if isinstance(body, dict) else None
-    if not isinstance(email, str) or len(email) > 254:
-        return error_response("Enter the email address for your account.", 400)
-    email = email.strip().casefold()
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-        return error_response("Enter a valid email address.", 400)
-    rate_key = hashlib.sha256(
-        f"password-reset:{request.remote_addr}".encode()
-    ).hexdigest()
-    if password_reset_rate_limited(rate_key):
-        return error_response(
-            "Too many reset requests. Try again in an hour.", 429
-        )
-    mail_config = mail_reset_configuration()
-    if mail_config is None:
-        return error_response(
-            "Password reset email is not configured. The site administrator must "
-            "configure secure outgoing email before password resets can be sent.",
-            503,
-        )
-    with connect_db() as connection:
-        user = connection.execute(
-            "SELECT id, email FROM users WHERE email = ?", (email,)
-        ).fetchone()
-    if user:
-        token = secrets.token_urlsafe(32)
-        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
-        with connect_db() as connection:
-            connection.execute(
-                """
-                INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    token_hash = excluded.token_hash,
-                    expires_at = excluded.expires_at
-                """,
-                (
-                    user["id"],
-                    hashlib.sha256(token.encode()).hexdigest(),
-                    expires_at,
-                ),
-            )
-        try:
-            send_password_reset_email(str(user["email"]), token)
-        except (OSError, smtplib.SMTPException, RuntimeError, ValueError) as error:
-            with connect_db() as connection:
-                connection.execute(
-                    "DELETE FROM password_reset_tokens WHERE user_id = ?",
-                    (user["id"],),
-                )
-            logger.exception("Could not send a password-reset email")
-            return error_response(
-                f"Could not send the password-reset email: {error}", 502
-            )
-    return jsonify(
-        {
-            "message": "If an account uses that email address, a password-reset link has been sent."
-        }
-    )
-
-
-@app.post("/auth/reset-password")
-def reset_password():
-    body = request.get_json(silent=True)
-    token = body.get("token") if isinstance(body, dict) else None
-    password = body.get("password") if isinstance(body, dict) else None
-    if (
-        not isinstance(token, str)
-        or len(token) > 256
-        or not isinstance(password, str)
-        or len(password) < 12
-        or len(password) > 256
-    ):
-        return error_response(
-            "Use a valid reset link and a new password of at least 12 characters.",
-            400,
-        )
-    token_hash = hashlib.sha256(token.encode()).hexdigest()
-    now = datetime.now(timezone.utc).isoformat()
-    with connect_db() as connection:
-        reset = connection.execute(
-            """
-            SELECT user_id FROM password_reset_tokens
-            WHERE token_hash = ? AND expires_at > ?
-            """,
-            (token_hash, now),
-        ).fetchone()
-        if reset is None:
-            return error_response(
-                "This password-reset link has expired or has already been used. Request a new one.",
-                400,
-            )
-        connection.execute(
-            "UPDATE users SET password_hash = ?, auth_version = auth_version + 1 WHERE id = ?",
-            (generate_password_hash(password), reset["user_id"]),
-        )
-        connection.execute(
-            "DELETE FROM password_reset_tokens WHERE user_id = ?",
-            (reset["user_id"],),
-        )
-    return jsonify({"message": "Your password has been reset. Sign in with your new password."})
 
 
 @app.post("/auth/login")
@@ -1581,7 +1371,6 @@ def login():
         return error_response("Email or password is incorrect.", 401)
     session.clear()
     session["user_id"] = int(user["id"])
-    session["auth_version"] = int(user["auth_version"])
     session["csrf_token"] = secrets.token_urlsafe(32)
     session.permanent = True
     response = jsonify(

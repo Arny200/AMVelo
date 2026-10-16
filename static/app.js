@@ -2317,10 +2317,7 @@ function setAuthMode(mode) {
   authMode = mode;
   const registering = mode === "register";
   $("auth-form").hidden = false;
-  $("forgot-password-form").hidden = true;
-  $("reset-password-form").hidden = true;
   $("auth-tabs").hidden = false;
-  $("forgot-password-button").hidden = registering;
   $("auth-hint").hidden = false;
   $("login-tab").classList.toggle("active", !registering);
   $("register-tab").classList.toggle("active", registering);
@@ -2337,69 +2334,6 @@ function setAuthMode(mode) {
 }
 $("login-tab").addEventListener("click", () => setAuthMode("login"));
 $("register-tab").addEventListener("click", () => setAuthMode("register"));
-$("forgot-password-button").addEventListener("click", () => {
-  $("auth-form").hidden = true;
-  $("auth-tabs").hidden = true;
-  $("forgot-password-button").hidden = true;
-  $("forgot-password-form").hidden = false;
-  $("forgot-email").value = $("auth-email").value;
-  $("forgot-message").textContent = "";
-  $("forgot-error").hidden = true;
-});
-$("forgot-back-button").addEventListener("click", () => {
-  $("forgot-password-form").hidden = true;
-  $("auth-form").hidden = false;
-  $("auth-tabs").hidden = false;
-  $("forgot-password-button").hidden = false;
-});
-$("forgot-password-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const button = $("forgot-password-form").querySelector('button[type="submit"]');
-  button.disabled = true;
-  $("forgot-error").hidden = true;
-  $("forgot-message").textContent = "";
-  try {
-    const result = await fetchJson("/auth/forgot-password", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: $("forgot-email").value }),
-    });
-    $("forgot-message").textContent = result.message;
-  } catch (error) {
-    $("forgot-error").textContent = error.message;
-    $("forgot-error").hidden = false;
-  } finally {
-    button.disabled = false;
-  }
-});
-$("reset-password-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const button = $("reset-password-form").querySelector('button[type="submit"]');
-  button.disabled = true;
-  $("reset-error").hidden = true;
-  try {
-    const result = await fetchJson("/auth/reset-password", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        token: new URLSearchParams(location.search).get("reset"),
-        password: $("new-password").value,
-      }),
-    });
-    history.replaceState({}, "", "/");
-    $("new-password").value = "";
-    $("reset-password-form").hidden = true;
-    $("auth-form").hidden = false;
-    $("auth-tabs").hidden = false;
-    $("forgot-password-button").hidden = false;
-    $("auth-hint").textContent = result.message;
-  } catch (error) {
-    $("reset-error").textContent = error.message;
-    $("reset-error").hidden = false;
-  } finally {
-    button.disabled = false;
-  }
-});
 $("auth-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const submit = $("auth-submit");
@@ -2524,15 +2458,7 @@ if (new URLSearchParams(location.search).has("connected")) {
 async function initialize() {
   try {
     await loadCsrfToken();
-    if (new URLSearchParams(location.search).has("reset")) {
-      $("auth-tabs").hidden = true;
-      $("auth-form").hidden = true;
-      $("forgot-password-button").hidden = true;
-      $("reset-password-form").hidden = false;
-      $("new-password").focus();
-    } else {
-      await loadStatus();
-    }
+    await loadStatus();
   } catch (error) {
     $("auth-error").textContent = error.message;
     $("auth-error").hidden = false;

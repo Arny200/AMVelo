@@ -60,25 +60,6 @@
           <p class="auth-error" id="auth-error" aria-live="polite" hidden></p>
           <button class="primary-button" id="auth-submit" type="submit"><span>Sign in</span><span aria-hidden="true">↗</span></button>
         </form>
-        <button class="auth-link" id="forgot-password-button" type="button">Forgot password?</button>
-        <form id="forgot-password-form" hidden>
-          <h2>Reset your password</h2>
-          <p class="intro">Enter your account email and we’ll send a secure reset link if it exists.</p>
-          <label class="field-label" for="forgot-email">EMAIL</label>
-          <input class="auth-input" id="forgot-email" type="email" autocomplete="email" maxlength="254" required>
-          <p class="auth-error" id="forgot-error" aria-live="polite" hidden></p>
-          <p class="auth-hint" id="forgot-message" aria-live="polite"></p>
-          <button class="primary-button" type="submit"><span>Send reset link</span><span aria-hidden="true">↗</span></button>
-          <button class="auth-link" id="forgot-back-button" type="button">Back to sign in</button>
-        </form>
-        <form id="reset-password-form" hidden>
-          <h2>Choose a new password</h2>
-          <p class="intro">Use at least 12 characters. This reset link can only be used once.</p>
-          <label class="field-label" for="new-password">NEW PASSWORD</label>
-          <input class="auth-input" id="new-password" type="password" autocomplete="new-password" minlength="12" maxlength="256" required>
-          <p class="auth-error" id="reset-error" aria-live="polite" hidden></p>
-          <button class="primary-button" type="submit"><span>Reset password</span><span aria-hidden="true">↗</span></button>
-        </form>
       </section>
       <div class="account-bar" id="account-bar" hidden>
         <span>PRIVATE ACCOUNT · <strong id="account-email"></strong></span>

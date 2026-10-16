@@ -794,55 +794,17 @@ class AccountIsolationTests(unittest.TestCase):
         self.assertEqual(response.json["places"][0]["return_km"], 11)
         self.assertEqual(requests.call_count, 2)
 
-    def test_password_reset_link_is_one_time_and_changes_password(self) -> None:
+    def test_password_reset_endpoints_are_removed(self) -> None:
         client = APPLICATION.app.test_client()
         csrf = self.csrf(client)
-        email = f"{uuid.uuid4().hex}@example.test"
-        registration = client.post(
-            "/auth/register",
-            json={"email": email, "password": "private-test-password-123"},
-            headers={"X-CSRF-Token": csrf},
-        )
-        self.assertEqual(registration.status_code, 201)
-        with patch.dict(
-            os.environ,
-            {"SMTP_HOST": "smtp.example.test", "SMTP_FROM": "AMVelo <reset@example.test>"},
-        ), patch.object(APPLICATION, "send_password_reset_email") as send_email:
-            requested = client.post(
-                "/auth/forgot-password",
-                json={"email": email},
-                headers={"X-CSRF-Token": registration.json["csrf_token"]},
-            )
-        self.assertEqual(requested.status_code, 200)
-        token = send_email.call_args.args[1]
-        reset = client.post(
-            "/auth/reset-password",
-            json={"token": token, "password": "new-private-test-password-456"},
-            headers={"X-CSRF-Token": registration.json["csrf_token"]},
-        )
-        self.assertEqual(reset.status_code, 200)
-        reused = client.post(
-            "/auth/reset-password",
-            json={"token": token, "password": "another-private-password-789"},
-            headers={"X-CSRF-Token": registration.json["csrf_token"]},
-        )
-        self.assertEqual(reused.status_code, 400)
-        self.assertEqual(client.get("/api/status").status_code, 401)
-
-        login_client = APPLICATION.app.test_client()
-        login_csrf = self.csrf(login_client)
-        old_password = login_client.post(
-            "/auth/login",
-            json={"email": email, "password": "private-test-password-123"},
-            headers={"X-CSRF-Token": login_csrf},
-        )
-        self.assertEqual(old_password.status_code, 401)
-        new_password = login_client.post(
-            "/auth/login",
-            json={"email": email, "password": "new-private-test-password-456"},
-            headers={"X-CSRF-Token": login_csrf},
-        )
-        self.assertEqual(new_password.status_code, 200)
+        for endpoint in ("/auth/forgot-password", "/auth/reset-password"):
+            with self.subTest(endpoint=endpoint):
+                response = client.post(
+                    endpoint,
+                    json={},
+                    headers={"X-CSRF-Token": csrf},
+                )
+                self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":

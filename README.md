@@ -39,22 +39,6 @@ py .\1.py
 
 Use a stable `SECRET_KEY` in production. Strava credentials are encrypted using that key; changing it makes existing credentials unreadable and requires affected users to reconnect. For automatic updates, register one Strava webhook for the app and set `callback_url` to its public HTTPS `/webhooks/strava` endpoint. Strava's webhook owner ID is mapped to the associated account before updating that user's activities.
 
-## Password recovery
-
-Password-reset emails require an SMTP server. Configure these environment variables before enabling account recovery:
-
-```powershell
-$env:SMTP_HOST = "smtp.example.com"
-$env:SMTP_PORT = "587"
-$env:SMTP_FROM = "AMVelo <no-reply@example.com>"
-$env:SMTP_USERNAME = "smtp-user"
-$env:SMTP_PASSWORD = "smtp-password"
-$env:SMTP_USE_TLS = "true"
-$env:PUBLIC_BASE_URL = "https://amvelo.example.com"
-```
-
-`SMTP_USERNAME` and `SMTP_PASSWORD` are optional when the SMTP server does not require authentication. Keep `SMTP_USE_TLS=true`; public deployments refuse to send reset mail without TLS and an HTTPS `PUBLIC_BASE_URL`. Reset links expire after 30 minutes and work once. Requests are rate-limited, and the response does not reveal whether an email belongs to an account. A successful password reset invalidates that account's existing sessions. The local development URL can be set to `http://localhost:5000`; do not use HTTP for a public site.
-
 ## Opening on a phone locally
 
 For testing on the same trusted home network, set `HOST` to `0.0.0.0` and open `http://COMPUTER-IP:5000` on the phone. Allow Windows Firewall access only on a private network. Do not port-forward this development server or expose it publicly. Browser geolocation and Strava OAuth generally require HTTPS; without it, tap the map to set a start point.
@@ -68,7 +52,7 @@ This source is a small application, not a managed production service. Before inv
 - Use the WSGI entry point with a production server, for example `waitress-serve --listen=127.0.0.1:5000 wsgi:app` behind the HTTPS proxy. Do not expose the WSGI server port directly to the internet.
 - Keep SQLite, its backups, and the signing/encryption key out of the web root and restrict filesystem access to the service account. Back up the key and database together.
 - Set up tested backup, restore, monitoring, and incident response. The application operator can access its server and database; account separation protects users from other ordinary website users, not from a compromised host or privileged server operator.
-- Configure and test SMTP password recovery, abuse protection behind your chosen reverse proxy, retention, and applicable privacy/legal obligations before advertising the service. Registration is self-service and currently does not verify email addresses.
+- Review account registration, abuse protection behind your chosen reverse proxy, retention, and applicable privacy/legal obligations before advertising the service. Registration is self-service and currently does not verify email addresses.
 - Complete Strava's application review/approval and follow the terms and limits of Strava and every map/routing/geocoding/weather provider you use.
 
 Every account's ride data, stats, route API, imports, and Strava sync are scoped to its authenticated account. Anonymous visitors cannot read those endpoints. Start and destination points are checked against the island boundary both in the browser and by the route API. Deleting an account requires its password, revokes its Strava authorization when connected, and removes that account's activities from the app.
